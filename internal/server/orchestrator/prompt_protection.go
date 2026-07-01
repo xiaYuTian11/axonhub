@@ -292,13 +292,21 @@ func protectPrompts(inbound *PersistentInboundTransformer) pipeline.Middleware {
 			return llmRequest, nil
 		}
 
-		// First pass: rejection check using standard replacement (all matches → same placeholder).
+		// First pass: rejection check only.
+		// ApplyPromptProtectionRules modifies messages in-place with fixed placeholders,
+		// so we must save and restore the original messages before and after.
+		originalMessages := make([]llm.Message, len(llmRequest.Messages))
+		copy(originalMessages, llmRequest.Messages)
+
 		rejectionCheck := biz.ApplyPromptProtectionRules(llmRequest, rules)
 		if rejectionCheck.Rejected {
 			return nil, fmt.Errorf("%w: %s", transformer.ErrInvalidRequest, promptProtectionRejectedMessage)
 		}
 
-		// Second pass: apply mask rules with unique per-match tags.
+		// Restore original messages (undo the fixed-placeholder masking from rejection check)
+		llmRequest.Messages = originalMessages
+
+		// Second pass: apply mask rules with unique per-match tags for later restoration.
 		MaskMessageWithUniqueTags(llmRequest.Messages, rules)
 
 		return llmRequest, nil
