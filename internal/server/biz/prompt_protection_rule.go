@@ -173,10 +173,26 @@ func ReplaceWithUniqueTags(pattern, content string, tagFunc func(original string
 		matchCount int
 	)
 
-	for match != nil && match.Length > 0 {
+	for match != nil {
 		matchCount++
-		if matchCount > 1000 { // Safety limit
+		if matchCount > 10000 { // Safety limit raised to handle large prompts
+			// Log warning but continue masking what we've collected so far
+			result = append(result, string(runes[lastIndex:]))
 			break
+		}
+
+		// Handle zero-width matches (lookahead, word boundaries, etc.)
+		// Advance by at least 1 rune to avoid infinite loop
+		if match.Length == 0 {
+			if lastIndex < len(runes) {
+				result = append(result, string(runes[lastIndex:lastIndex+1]))
+				lastIndex++
+			}
+			match, err = match.NextMatch()
+			if err != nil {
+				break
+			}
+			continue
 		}
 
 		result = append(result, string(runes[lastIndex:match.Index]))

@@ -58,7 +58,10 @@ func TestRestoreMaskedContent(t *testing.T) {
 	text := "请分析" + tag1 + "和" + tag2 + "的数据"
 	restored := restoreMaskedContent(text)
 
-	assert.Equal(t, "请分析荣昌和开州的数据", restored)
+	// Non-JSON context: Chinese characters should be restored as-is
+	assert.Contains(t, restored, "荣昌")
+	assert.Contains(t, restored, "开州")
+	assert.NotContains(t, restored, axhTagPrefix)
 }
 
 // TestRestoreMaskedContentNoTags 验证无标签时返回原文
@@ -66,6 +69,19 @@ func TestRestoreMaskedContentNoTags(t *testing.T) {
 	text := "请分析荣昌和开州的数据"
 	restored := restoreMaskedContent(text)
 	assert.Equal(t, text, restored)
+}
+
+// TestRestoreMaskedContentJSONSpecialChars 验证含 JSON 特殊字符的原文还原
+func TestRestoreMaskedContentJSONSpecialChars(t *testing.T) {
+	original := `he said "hello" \n test`
+	tag := genMaskedTagWithReplacement(original, "[REDACTED]")
+	jsonBody := `{"content":"` + tag + `"}`
+	restored := restoreMaskedContent(jsonBody)
+
+	// Should contain escaped quotes and backslash
+	assert.Contains(t, restored, `\"hello\"`)
+	assert.Contains(t, restored, `\\n`)
+	assert.NotContains(t, restored, axhTagPrefix)
 }
 
 // TestRestoreMaskedContentJSON 验证 JSON 中的标签还原

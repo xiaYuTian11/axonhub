@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/log"
 	"github.com/looplj/axonhub/internal/objects"
 	"github.com/looplj/axonhub/internal/server/biz"
@@ -64,6 +65,8 @@ func containsMaskedContent(messages []llm.Message) bool {
 }
 
 // restoreMaskedContent replaces all unique tags in text with their original content.
+// The original content is JSON-escaped if it contains JSON special characters
+// (quotes, backslashes, newlines) to preserve JSON structure in response bodies.
 func restoreMaskedContent(text string) string {
 	if !strings.Contains(text, axhTagPrefix) {
 		return text
@@ -93,7 +96,10 @@ func restoreMaskedContent(text string) string {
 		tag := rest[start : start+end+1]
 		original, ok := parseMaskedTag(tag)
 		if ok {
-			result.WriteString(original)
+			// Escape JSON special characters in the restored content to avoid
+			// corrupting JSON response structure when the original text contains
+			// quotes, backslashes, or control characters.
+			result.WriteString(jsonEscapeString(original))
 		} else {
 			result.WriteString(tag)
 		}
@@ -102,6 +108,35 @@ func restoreMaskedContent(text string) string {
 	}
 
 	return result.String()
+}
+
+// jsonEscapeString escapes JSON special characters in a string.
+// This is used when restoring masked content inside JSON response bodies
+// to prevent structural corruption (e.g. original text containing quotes
+// could break JSON parsing if inserted unescaped).
+func jsonEscapeString(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch r {
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		default:
+			if r < 0x20 {
+				fmt.Fprintf(&b, `\u%04x`, r)
+			} else {
+				b.WriteRune(r)
+			}
+		}
+	}
+	return b.String()
 }
 
 // parseMaskedTag extracts the original text from a unique tag.
@@ -243,13 +278,14 @@ func protectPrompts(inbound *PersistentInboundTransformer) pipeline.Middleware {
 		provider, canList := inbound.state.PromptProtecter.(listEnabledRuleProvider)
 		if !canList {
 			// Fallback: use standard Protect (fixed replacement, no per-match uniqueness).
-			return fallbackProtect(inbound.state.PromptProtecter, llmRequest)
+			return fallbackProtect(ctx, inbound.state.PromptProtecter, llmRequest)
 		}
 
 		rules, err := provider.ListEnabledRules(ctx)
 		if err != nil {
-			log.Warn(ctx, "failed to load enabled prompt protection rules, passing through", log.Cause(err))
-			return llmRequest, nil
+			log.Error(ctx, "failed to load enabled prompt protection rules", log.Cause(err))
+			// SECURITY: fail closed on rule loading errors to avoid leaking sensitive content
+			return nil, fmt.Errorf("prompt protection unavailable: %w", err)
 		}
 
 		if len(rules) == 0 {
@@ -270,8 +306,8 @@ func protectPrompts(inbound *PersistentInboundTransformer) pipeline.Middleware {
 }
 
 // fallbackProtect handles the case where PromptProtecter doesn't expose ListEnabledRules.
-func fallbackProtect(protecter PromptProtecter, llmRequest *llm.Request) (*llm.Request, error) {
-	protected, err := protecter.Protect(context.Background(), llmRequest)
+func fallbackProtect(ctx context.Context, protecter PromptProtecter, llmRequest *llm.Request) (*llm.Request, error) {
+	protected, err := protecter.Protect(ctx, llmRequest)
 	if err != nil {
 		return llmRequest, err
 	}
