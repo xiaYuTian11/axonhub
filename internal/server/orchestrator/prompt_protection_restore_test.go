@@ -51,6 +51,9 @@ func TestGenMaskedTagReplacementVisible(t *testing.T) {
 }
 
 // TestRestoreMaskedContent 验证完整文本中的标签还原
+// Note: restoreMaskedContent applies JSON escaping since it's used in HTTP response
+// bodies (JSON format). For plain Chinese characters without JSON special chars,
+// the escaped output is identical to the original.
 func TestRestoreMaskedContent(t *testing.T) {
 	tag1 := genMaskedTagWithReplacement("荣昌", "[REDACTED]")
 	tag2 := genMaskedTagWithReplacement("开州", "[REDACTED]")
@@ -58,7 +61,7 @@ func TestRestoreMaskedContent(t *testing.T) {
 	text := "请分析" + tag1 + "和" + tag2 + "的数据"
 	restored := restoreMaskedContent(text)
 
-	// Non-JSON context: Chinese characters should be restored as-is
+	// Chinese characters are not JSON special chars, so no escaping needed
 	assert.Contains(t, restored, "荣昌")
 	assert.Contains(t, restored, "开州")
 	assert.NotContains(t, restored, axhTagPrefix)

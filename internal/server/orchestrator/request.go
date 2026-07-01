@@ -38,34 +38,12 @@ func (m *persistRequestMiddleware) OnInboundLlmRequest(ctx context.Context, llmR
 		return llmRequest, nil
 	}
 
-	// Use original unmasked messages for database persistence if available
-	requestToStore := llmRequest
-	if containsMaskedContent(llmRequest.Messages) {
-		// Create a copy with restored content for persistence
-		requestToStore = &llm.Request{}
-		*requestToStore = *llmRequest
-		requestToStore.Messages = make([]llm.Message, len(llmRequest.Messages))
-		copy(requestToStore.Messages, llmRequest.Messages)
-
-		// Restore masked content in messages
-		for i := range requestToStore.Messages {
-			if requestToStore.Messages[i].Content.Content != nil {
-				restored := restoreMaskedContent(*requestToStore.Messages[i].Content.Content)
-				requestToStore.Messages[i].Content.Content = &restored
-			}
-
-			for j := range requestToStore.Messages[i].Content.MultipleContent {
-				if requestToStore.Messages[i].Content.MultipleContent[j].Text != nil {
-					restored := restoreMaskedContent(*requestToStore.Messages[i].Content.MultipleContent[j].Text)
-					requestToStore.Messages[i].Content.MultipleContent[j].Text = &restored
-				}
-			}
-		}
-	}
-
+	// Note: CreateRequest stores httpRequest.Body (raw client JSON) which is the
+	// original unmasked content. The llmRequest parameter is used for metadata
+	// (model, stream flag, etc.) only, so no message restoration is needed here.
 	request, err := m.inbound.state.RequestService.CreateRequest(
 		ctx,
-		requestToStore,
+		llmRequest,
 		m.inbound.state.RawRequest,
 		llmRequest.APIFormat,
 	)
