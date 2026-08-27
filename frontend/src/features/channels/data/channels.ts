@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { graphqlRequest } from '@/gql/graphql';
 import { pageInfoSchema } from '@/gql/pagination';
 import { useTranslation } from 'react-i18next';
@@ -22,6 +22,7 @@ import {
   bulkUpdateChannelOrderingResultSchema,
   channelSummaryConnectionSchema,
   ChannelSettings,
+  ProxyConfig,
   ChannelPolicies,
   ChannelModelPrice,
   SaveChannelModelPriceInput,
@@ -76,6 +77,7 @@ const CREATE_CHANNEL_MUTATION = `
       status
       policies {
         stream
+        apiKeyAutoDisableRules { statusCodes keywordPatterns times action disableDurationMinutes disableUntilCron disableUntilTimezone }
       }
       supportedModels
       autoSyncSupportedModels
@@ -98,11 +100,13 @@ const CREATE_CHANNEL_MUTATION = `
           url
           username
           password
+          disableConnectionReuse
         }
         transformOptions {
           forceArrayInstructions
           forceArrayInputs
           replaceDeveloperRoleWithSystem
+          reasoningEffortMapping { from to }
         }
         passThroughUserAgent
         passThroughBody
@@ -110,12 +114,6 @@ const CREATE_CHANNEL_MUTATION = `
         retryableErrorPatterns {
           pattern
           regex
-        }
-        providerQuota {
-          opencodeGo {
-            workspaceId
-            authCookie
-          }
         }
       }
       orderingWeight
@@ -148,6 +146,7 @@ const DUPLICATE_CHANNEL_MUTATION = `
       status
       policies {
         stream
+        apiKeyAutoDisableRules { statusCodes keywordPatterns times action disableDurationMinutes disableUntilCron disableUntilTimezone }
       }
       supportedModels
       autoSyncSupportedModels
@@ -170,11 +169,13 @@ const DUPLICATE_CHANNEL_MUTATION = `
           url
           username
           password
+          disableConnectionReuse
         }
         transformOptions {
           forceArrayInstructions
           forceArrayInputs
           replaceDeveloperRoleWithSystem
+          reasoningEffortMapping { from to }
         }
         passThroughUserAgent
         passThroughBody
@@ -182,12 +183,6 @@ const DUPLICATE_CHANNEL_MUTATION = `
         retryableErrorPatterns {
           pattern
           regex
-        }
-        providerQuota {
-          opencodeGo {
-            workspaceId
-            authCookie
-          }
         }
       }
       orderingWeight
@@ -220,6 +215,7 @@ const BULK_CREATE_CHANNELS_MUTATION = `
       status
       policies {
         stream
+        apiKeyAutoDisableRules { statusCodes keywordPatterns times action disableDurationMinutes disableUntilCron disableUntilTimezone }
       }
       supportedModels
       autoSyncSupportedModels
@@ -242,11 +238,13 @@ const BULK_CREATE_CHANNELS_MUTATION = `
           url
           username
           password
+          disableConnectionReuse
         }
         transformOptions {
           forceArrayInstructions
           forceArrayInputs
           replaceDeveloperRoleWithSystem
+          reasoningEffortMapping { from to }
         }
         passThroughUserAgent
         passThroughBody
@@ -254,12 +252,6 @@ const BULK_CREATE_CHANNELS_MUTATION = `
         retryableErrorPatterns {
           pattern
           regex
-        }
-        providerQuota {
-          opencodeGo {
-            workspaceId
-            authCookie
-          }
         }
       }
       orderingWeight
@@ -292,6 +284,7 @@ const UPDATE_CHANNEL_MUTATION = `
       status
       policies {
         stream
+        apiKeyAutoDisableRules { statusCodes keywordPatterns times action disableDurationMinutes disableUntilCron disableUntilTimezone }
       }
       supportedModels
       autoSyncSupportedModels
@@ -314,11 +307,13 @@ const UPDATE_CHANNEL_MUTATION = `
           url
           username
           password
+          disableConnectionReuse
         }
         transformOptions {
           forceArrayInstructions
           forceArrayInputs
           replaceDeveloperRoleWithSystem
+          reasoningEffortMapping { from to }
         }
         passThroughUserAgent
         passThroughBody
@@ -326,12 +321,6 @@ const UPDATE_CHANNEL_MUTATION = `
         retryableErrorPatterns {
           pattern
           regex
-        }
-        providerQuota {
-          opencodeGo {
-            workspaceId
-            authCookie
-          }
         }
       }
       orderingWeight
@@ -508,6 +497,7 @@ const BULK_IMPORT_CHANNELS_MUTATION = `
             forceArrayInstructions
             forceArrayInputs
             replaceDeveloperRoleWithSystem
+            reasoningEffortMapping { from to }
           }
           passThroughUserAgent
           passThroughBody
@@ -515,12 +505,6 @@ const BULK_IMPORT_CHANNELS_MUTATION = `
           retryableErrorPatterns {
             pattern
             regex
-          }
-          providerQuota {
-            opencodeGo {
-              workspaceId
-              authCookie
-            }
           }
         }
       }
@@ -572,6 +556,7 @@ const GET_CHANNEL_DISABLED_API_KEYS_QUERY = `
           disabledAt
           errorCode
           reason
+          expiresAt
         }
       }
     }
@@ -610,6 +595,38 @@ const GET_CHANNEL_MODEL_PRICES_QUERY = `
                   tiers {
                     upTo
                     pricePerUnit
+                  }
+                }
+              }
+            }
+          }
+          schedule {
+            timezone
+            overrides {
+              name
+              priority
+              when {
+                dailyTime {
+                  start
+                  end
+                }
+                weekdays
+                dateRange {
+                  start
+                  end
+                }
+              }
+              items {
+                itemCode
+                pricing {
+                  mode
+                  flatFee
+                  usagePerUnit
+                  usageTiered {
+                    tiers {
+                      upTo
+                      pricePerUnit
+                    }
                   }
                 }
               }
@@ -705,6 +722,7 @@ const BULK_UPDATE_CHANNEL_ORDERING_MUTATION = `
             forceArrayInstructions
             forceArrayInputs
             replaceDeveloperRoleWithSystem
+            reasoningEffortMapping { from to }
           }
           passThroughUserAgent
           passThroughBody
@@ -712,12 +730,6 @@ const BULK_UPDATE_CHANNEL_ORDERING_MUTATION = `
           retryableErrorPatterns {
             pattern
             regex
-          }
-          providerQuota {
-            opencodeGo {
-              workspaceId
-              authCookie
-            }
           }
         }
       }
@@ -790,6 +802,7 @@ const QUERY_CHANNELS_QUERY = `
           status
           policies {
             stream
+            apiKeyAutoDisableRules { statusCodes keywordPatterns times action disableDurationMinutes disableUntilCron disableUntilTimezone }
           }
           credentials {
             apiKey
@@ -849,11 +862,13 @@ const QUERY_CHANNELS_QUERY = `
               url
               username
               password
+              disableConnectionReuse
             }
             transformOptions {
               forceArrayInstructions
               forceArrayInputs
               replaceDeveloperRoleWithSystem
+              reasoningEffortMapping { from to }
             }
             passThroughUserAgent
             passThroughBody
@@ -868,12 +883,6 @@ const QUERY_CHANNELS_QUERY = `
             retryableErrorPatterns {
               pattern
               regex
-            }
-            providerQuota {
-              opencodeGo {
-                workspaceId
-                authCookie
-              }
             }
           }
           orderingWeight
@@ -896,6 +905,7 @@ const QUERY_CHANNELS_QUERY = `
             disabledAt
             errorCode
             reason
+            expiresAt
           }
           liveLimiterStats {
             inFlight
@@ -1015,6 +1025,9 @@ export function useQueryChannels(
     // 5s is light traffic; pause when the tab is hidden.
     refetchInterval: 5000,
     refetchIntervalInBackground: false,
+    // Keep showing the previous data while a refetch is in-flight or fails,
+    // so the component never renders with data = undefined and crashes.
+    placeholderData: keepPreviousData,
   });
 }
 
@@ -1393,7 +1406,7 @@ export function useTestChannel(options?: { silent?: boolean }) {
     }: {
       channelID: string;
       modelID?: string;
-      proxy?: { type: string; url?: string; username?: string; password?: string };
+      proxy?: ProxyConfig;
     }) => {
       try {
         const data = await graphqlRequest<{
@@ -1771,6 +1784,7 @@ export function useChannelDisabledAPIKeys(channelId: string, options?: { enabled
               disabledAt: string;
               errorCode: number;
               reason?: string | null;
+              expiresAt?: string | null;
             }>;
           };
         }>(GET_CHANNEL_DISABLED_API_KEYS_QUERY, { id: channelId });

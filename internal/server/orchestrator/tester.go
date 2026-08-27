@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -25,6 +26,8 @@ import (
 )
 
 const testChannelAPIKeysMaxConcurrency = 8
+
+const responsesWebSocketTestPrompt = "ping"
 
 // TestChannelOrchestrator handles channel testing functionality.
 // It is stateless and can be reused across multiple test requests.
@@ -68,6 +71,68 @@ func NewTestChannelOrchestrator(
 type TestChannelRequest struct {
 	ChannelID objects.GUID
 	ModelID   *string
+}
+
+// buildChannelTestRequest creates the request used by channel tests.
+func buildChannelTestRequest(model string, useStream bool, systemPrompt string, userPrompt string, responsesWebSocket bool) *llm.Request {
+	req := &llm.Request{
+		Model: model,
+		Messages: []llm.Message{
+			{
+				Role:    "system",
+				Content: llm.MessageContent{Content: lo.ToPtr(systemPrompt)},
+			},
+			{
+				Role:    "user",
+				Content: llm.MessageContent{Content: lo.ToPtr(userPrompt)},
+			},
+		},
+		MaxCompletionTokens: lo.ToPtr(int64(256)),
+		Stream:              lo.ToPtr(useStream),
+	}
+
+	if responsesWebSocket {
+		req.Messages = []llm.Message{{
+			Role:    "user",
+			Content: llm.MessageContent{Content: lo.ToPtr(responsesWebSocketTestPrompt)},
+		}}
+		req.MaxCompletionTokens = nil
+		req.Stream = lo.ToPtr(true)
+	}
+
+	return req
+}
+
+// usesResponsesWebSocket reports whether a channel routes Responses requests over WebSocket.
+func usesResponsesWebSocket(channel *biz.Channel) bool {
+	if channel == nil {
+		return false
+	}
+
+	for _, endpoint := range channel.ResolveEndpoints() {
+		if endpoint.APIFormat != llm.APIFormatOpenAIResponse.String() && endpoint.APIFormat != llm.APIFormatOpenAIResponseCompact.String() {
+			continue
+		}
+
+		transport := strings.ToLower(strings.TrimSpace(endpoint.Transport))
+		if transport == objects.ChannelEndpointTransportWebSocket {
+			return true
+		}
+		if transport != "" {
+			continue
+		}
+
+		baseURL := endpoint.BaseURL
+		if baseURL == "" {
+			baseURL = channel.BaseURL
+		}
+		baseURL = strings.ToLower(strings.TrimSpace(baseURL))
+		if strings.HasPrefix(baseURL, "ws://") || strings.HasPrefix(baseURL, "wss://") {
+			return true
+		}
+	}
+
+	return false
 }
 
 // TestChannelResult represents the result of a channel test.
@@ -118,39 +183,15 @@ func (processor *TestChannelOrchestrator) TestChannel(
 	if testModel == "" {
 		testModel = channel.DefaultTestModel
 	}
+	systemPrompt, userPrompt, err := processor.systemService.ChannelTestPrompts(ctx)
+	if err != nil {
+		return nil, err
+	}
 
 	// Check if the channel requires streaming
 	useStream := channel != nil && channel.Policies.Stream == objects.CapabilityPolicyRequire
 
-	// Create a simple test request
-	llmRequest := &llm.Request{
-		Model: testModel,
-		Messages: []llm.Message{
-			{
-				Role: "system",
-				Content: llm.MessageContent{
-					Content: lo.ToPtr("You are a helpful assistant."),
-				},
-			},
-			{
-				Role: "user",
-				Content: llm.MessageContent{
-					MultipleContent: []llm.MessageContentPart{
-						{
-							Type: "text",
-							Text: lo.ToPtr("Hello world, I'm AxonHub."),
-						},
-						{
-							Type: "text",
-							Text: lo.ToPtr("Please tell me who you are?"),
-						},
-					},
-				},
-			},
-		},
-		MaxCompletionTokens: lo.ToPtr(int64(256)),
-		Stream:              lo.ToPtr(useStream),
-	}
+	llmRequest := buildChannelTestRequest(testModel, useStream, systemPrompt, userPrompt, usesResponsesWebSocket(channel))
 
 	body, err := json.Marshal(llmRequest)
 	if err != nil {
@@ -346,6 +387,11 @@ func (processor *TestChannelOrchestrator) TestChannelAPIKeys(
 	}
 
 	useStream := ch.Policies.Stream == objects.CapabilityPolicyRequire
+	responsesWebSocket := usesResponsesWebSocket(ch)
+	systemPrompt, userPrompt, err := processor.systemService.ChannelTestPrompts(ctx)
+	if err != nil {
+		return nil, err
+	}
 
 	results := make([]*TestAPIKeyResult, len(allKeys))
 
@@ -377,7 +423,7 @@ func (processor *TestChannelOrchestrator) TestChannelAPIKeys(
 			default:
 			}
 
-			result := processor.testSingleKey(groupCtx, channelID, apiKey, testModel, useStream, proxy)
+			result := processor.testSingleKey(groupCtx, channelID, apiKey, testModel, useStream, responsesWebSocket, proxy, systemPrompt, userPrompt)
 			_, isDisabled := disabledSet[apiKey]
 			result.Disabled = isDisabled
 			results[index] = result
@@ -437,13 +483,18 @@ func (processor *TestChannelOrchestrator) TestSingleAPIKey(
 	}
 
 	useStream := ch.Policies.Stream == objects.CapabilityPolicyRequire
+	responsesWebSocket := usesResponsesWebSocket(ch)
+	systemPrompt, userPrompt, err := processor.systemService.ChannelTestPrompts(ctx)
+	if err != nil {
+		return nil, err
+	}
 
 	disabledSet := make(map[string]struct{}, len(ch.DisabledAPIKeys))
 	for _, dk := range ch.DisabledAPIKeys {
 		disabledSet[dk.Key] = struct{}{}
 	}
 
-	result := processor.testSingleKey(ctx, channelID, key, testModel, useStream, proxy)
+	result := processor.testSingleKey(ctx, channelID, key, testModel, useStream, responsesWebSocket, proxy, systemPrompt, userPrompt)
 	_, isDisabled := disabledSet[key]
 	result.Disabled = isDisabled
 
@@ -457,7 +508,10 @@ func (processor *TestChannelOrchestrator) testSingleKey(
 	key string,
 	testModel string,
 	useStream bool,
+	responsesWebSocket bool,
 	proxy *httpclient.ProxyConfig,
+	systemPrompt string,
+	userPrompt string,
 ) *TestAPIKeyResult {
 	keyPrefix := maskAPIKey(key)
 
@@ -489,34 +543,7 @@ func (processor *TestChannelOrchestrator) testSingleKey(
 		modelCircuitBreaker:        processor.modelCircuitBreaker,
 	}
 
-	llmRequest := &llm.Request{
-		Model: testModel,
-		Messages: []llm.Message{
-			{
-				Role: "system",
-				Content: llm.MessageContent{
-					Content: new("You are a helpful assistant."),
-				},
-			},
-			{
-				Role: "user",
-				Content: llm.MessageContent{
-					MultipleContent: []llm.MessageContentPart{
-						{
-							Type: "text",
-							Text: new("Hello world, I'm AxonHub."),
-						},
-						{
-							Type: "text",
-							Text: new("Please tell me who you are?"),
-						},
-					},
-				},
-			},
-		},
-		MaxCompletionTokens: new(int64(256)),
-		Stream:              new(useStream),
-	}
+	llmRequest := buildChannelTestRequest(testModel, useStream, systemPrompt, userPrompt, responsesWebSocket)
 
 	body, err := json.Marshal(llmRequest)
 	if err != nil {

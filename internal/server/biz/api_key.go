@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/netip"
+	"reflect"
 	"strings"
 	"time"
 
@@ -320,6 +322,11 @@ func (s *APIKeyService) CreateAPIKey(ctx context.Context, input ent.CreateAPIKey
 
 		apiKeyType = *input.Type
 	}
+	if apiKeyType == apikey.TypeUser {
+		if err := s.requireProjectAdmin(ctx, user.ID, input.ProjectID); err != nil {
+			return nil, err
+		}
+	}
 
 	// Generate API key with configured prefix
 	generatedKey, err := GenerateAPIKey(s.keyPrefix)
@@ -376,6 +383,13 @@ func (s *APIKeyService) CreateAPIKey(ctx context.Context, input ent.CreateAPIKey
 			}
 		}
 
+		if len(input.AllowedIps) > 0 {
+			if err := validateAllowedIPs(input.AllowedIps); err != nil {
+				return err
+			}
+			create.SetAllowedIps(input.AllowedIps)
+		}
+
 		created, err := create.Save(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to create API key: %w", err)
@@ -392,6 +406,29 @@ func (s *APIKeyService) CreateAPIKey(ctx context.Context, input ent.CreateAPIKey
 	return apiKey, nil
 }
 
+func (s *APIKeyService) requireProjectAdmin(ctx context.Context, userID, projectID int) error {
+	currentUser, err := authz.RunWithSystemBypass(ctx, "api-key-project-permission", func(bypassCtx context.Context) (*ent.User, error) {
+		return s.entFromContext(bypassCtx).User.Query().
+			Where(user.IDEQ(userID)).
+			WithRoles().
+			WithProjectUsers().
+			Only(bypassCtx)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to load API key creator permissions: %w", err)
+	}
+
+	projectCtx := contexts.WithUser(ctx, currentUser)
+	if err := NewPermissionValidator().CanGrantScopes(projectCtx, []string{
+		string(scopes.ScopeWriteUsers),
+		string(scopes.ScopeWriteRoles),
+	}, &projectID); err != nil {
+		return fmt.Errorf("permission denied: project API keys require project admin permissions")
+	}
+
+	return nil
+}
+
 // UpdateAPIKey updates an existing API key.
 func (s *APIKeyService) UpdateAPIKey(ctx context.Context, id int, input ent.UpdateAPIKeyInput) (*ent.APIKey, error) {
 	var result *ent.APIKey
@@ -404,14 +441,24 @@ func (s *APIKeyService) UpdateAPIKey(ctx context.Context, id int, input ent.Upda
 			return fmt.Errorf("failed to get API key: %w", err)
 		}
 
-		if apiKey.Type == apikey.TypeUser {
+		if apiKey.Type == apikey.TypeUser || apiKey.Type == apikey.TypePersonal {
 			if len(input.Scopes) > 0 || len(input.AppendScopes) > 0 || input.ClearScopes {
-				return fmt.Errorf("user type API key cannot update scopes")
+				return fmt.Errorf("%s type API key cannot update scopes", apiKey.Type)
 			}
 		}
 
 		if apiKey.Type == apikey.TypeNoauth {
 			return fmt.Errorf("noauth type API key cannot be updated")
+		}
+
+		if apiKey.Type == apikey.TypePersonal {
+			user, ok := contexts.GetUser(ctx)
+			if !ok {
+				return fmt.Errorf("user not found in context")
+			}
+			if apiKey.UserID != user.ID {
+				return fmt.Errorf("personal API key can only be modified by its creator")
+			}
 		}
 
 		// Renaming: serialize same-project name operations and reject a duplicate
@@ -455,6 +502,24 @@ func (s *APIKeyService) UpdateAPIKey(ctx context.Context, id int, input ent.Upda
 			}
 		}
 
+		if input.ClearAllowedIps {
+			update.ClearAllowedIps()
+		}
+
+		if len(input.AllowedIps) > 0 {
+			if err := validateAllowedIPs(input.AllowedIps); err != nil {
+				return err
+			}
+			update.SetAllowedIps(input.AllowedIps)
+		}
+
+		if len(input.AppendAllowedIps) > 0 {
+			if err := validateAllowedIPs(input.AppendAllowedIps); err != nil {
+				return err
+			}
+			update.AppendAllowedIps(input.AppendAllowedIps)
+		}
+
 		updated, err := update.Save(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to update API key: %w", err)
@@ -486,6 +551,16 @@ func (s *APIKeyService) UpdateAPIKeyStatus(ctx context.Context, id int, status a
 		return nil, fmt.Errorf("noauth type API key status cannot be updated")
 	}
 
+	if existing.Type == apikey.TypePersonal {
+		user, ok := contexts.GetUser(ctx)
+		if !ok {
+			return nil, fmt.Errorf("user not found in context")
+		}
+		if existing.UserID != user.ID {
+			return nil, fmt.Errorf("personal API key can only be modified by its creator")
+		}
+	}
+
 	apiKey, err := client.APIKey.UpdateOneID(id).
 		SetStatus(status).
 		Save(ctx)
@@ -512,6 +587,16 @@ func (s *APIKeyService) UpdateAPIKeyProfiles(ctx context.Context, id int, profil
 		return nil, fmt.Errorf("noauth type API key profiles cannot be updated")
 	}
 
+	if existing.Type == apikey.TypePersonal {
+		user, ok := contexts.GetUser(ctx)
+		if !ok {
+			return nil, fmt.Errorf("user not found in context")
+		}
+		if existing.UserID != user.ID {
+			return nil, fmt.Errorf("personal API key can only be modified by its creator")
+		}
+	}
+
 	// Validate that profile names are unique (case-insensitive)
 	if err := validateProfileNames(profiles.Profiles); err != nil {
 		return nil, err
@@ -525,11 +610,20 @@ func (s *APIKeyService) UpdateAPIKeyProfiles(ctx context.Context, id int, profil
 	if err := validateProfileFilters(profiles.Profiles); err != nil {
 		return nil, err
 	}
+	if err := validateProfileRoutingPolicies(profiles.Profiles); err != nil {
+		return nil, err
+	}
 
 	// Validate quota configuration (if present)
 	if err := validateProfileQuota(profiles.Profiles); err != nil {
 		return nil, err
 	}
+
+	// A profile remains linked only while a direct API key edit leaves its
+	// template-managed contents untouched. This lets callers change the active
+	// profile without breaking links, while any one-off profile customization
+	// automatically detaches only that profile from future template publishes.
+	detachModifiedTemplateProfiles(existing.Profiles, &profiles)
 
 	apiKey, err := client.APIKey.UpdateOneID(id).
 		SetProfiles(&profiles).
@@ -542,6 +636,83 @@ func (s *APIKeyService) UpdateAPIKeyProfiles(ctx context.Context, id int, profil
 	s.invalidateAPIKeyCaches(ctx, apiKey.Key)
 
 	return apiKey, nil
+}
+
+func detachModifiedTemplateProfiles(existing, next *objects.APIKeyProfiles) {
+	if next == nil {
+		return
+	}
+
+	for i := range next.Profiles {
+		profile := &next.Profiles[i]
+		if profile.TemplateID == nil {
+			profile.TemplateName = ""
+			continue
+		}
+
+		linkedProfile := findLinkedProfile(existing, *profile.TemplateID, profile.Name)
+		if linkedProfile == nil || !sameProfileIgnoringTemplate(linkedProfile, profile) {
+			profile.TemplateID = nil
+			profile.TemplateName = ""
+		} else {
+			profile.TemplateName = linkedProfile.TemplateName
+		}
+	}
+}
+
+func findLinkedProfile(profiles *objects.APIKeyProfiles, templateID int, name string) *objects.APIKeyProfile {
+	if profiles == nil {
+		return nil
+	}
+
+	for i := range profiles.Profiles {
+		profile := &profiles.Profiles[i]
+		if profile.TemplateID != nil && *profile.TemplateID == templateID && profile.Name == name {
+			return profile
+		}
+	}
+
+	return nil
+}
+
+func sameProfileIgnoringTemplate(a, b *objects.APIKeyProfile) bool {
+	left := normalizeProfileForComparison(a)
+	right := normalizeProfileForComparison(b)
+	left.TemplateID = nil
+	right.TemplateID = nil
+	left.TemplateName = ""
+	right.TemplateName = ""
+
+	return reflect.DeepEqual(left, right)
+}
+
+func normalizeProfileForComparison(profile *objects.APIKeyProfile) *objects.APIKeyProfile {
+	result := profile.Clone()
+	if result.ModelMappings == nil {
+		result.ModelMappings = []objects.ModelMapping{}
+	}
+	if result.ChannelIDs == nil {
+		result.ChannelIDs = []int{}
+	}
+	if result.ChannelTags == nil {
+		result.ChannelTags = []string{}
+	}
+	if result.ModelIDs == nil {
+		result.ModelIDs = []string{}
+	}
+	result.ChannelTagsMatchMode = result.ChannelTagsMatchMode.OrDefault()
+	loadBalanceStrategy := objects.RoutingPolicyDefault
+	if result.LoadBalanceStrategy != nil {
+		loadBalanceStrategy = objects.NormalizeRoutingPolicyValue(*result.LoadBalanceStrategy)
+	}
+	result.LoadBalanceStrategy = &loadBalanceStrategy
+	traceStickyMode := objects.RoutingPolicyDefault
+	if result.TraceStickyMode != nil {
+		traceStickyMode = objects.NormalizeRoutingPolicyValue(*result.TraceStickyMode)
+	}
+	result.TraceStickyMode = &traceStickyMode
+
+	return result
 }
 
 // validateProfileNames checks that all profile names are unique (case-insensitive).
@@ -580,6 +751,44 @@ func validateProfileFilters(profiles []objects.APIKeyProfile) error {
 		if !profile.ChannelTagsMatchMode.IsValid() {
 			return fmt.Errorf("profile '%s' channelTagsMatchMode is invalid", profile.Name)
 		}
+	}
+
+	return nil
+}
+
+func validateProfileRoutingPolicies(profiles []objects.APIKeyProfile) error {
+	for i := range profiles {
+		if err := normalizeAndValidateProfileRoutingPolicy(&profiles[i]); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func normalizeAndValidateProfileRoutingPolicy(profile *objects.APIKeyProfile) error {
+	if profile == nil {
+		return nil
+	}
+
+	if profile.LoadBalanceStrategy == nil {
+		profile.LoadBalanceStrategy = lo.ToPtr(objects.RoutingPolicyDefault)
+	} else {
+		normalized := objects.NormalizeRoutingPolicyValue(*profile.LoadBalanceStrategy)
+		profile.LoadBalanceStrategy = &normalized
+	}
+	if !objects.IsValidLoadBalancerStrategy(*profile.LoadBalanceStrategy) {
+		return fmt.Errorf("profile '%s' loadBalanceStrategy is invalid", profile.Name)
+	}
+
+	if profile.TraceStickyMode == nil {
+		profile.TraceStickyMode = lo.ToPtr(objects.RoutingPolicyDefault)
+	} else {
+		normalized := objects.NormalizeRoutingPolicyValue(*profile.TraceStickyMode)
+		profile.TraceStickyMode = &normalized
+	}
+	if !objects.IsValidTraceStickyMode(*profile.TraceStickyMode) {
+		return fmt.Errorf("profile '%s' traceStickyMode is invalid", profile.Name)
 	}
 
 	return nil
@@ -636,6 +845,27 @@ func validateProfileQuota(profiles []objects.APIKeyProfile) error {
 			}
 		default:
 			return fmt.Errorf("profile '%s' quota.period.type is invalid", profile.Name)
+		}
+	}
+
+	return nil
+}
+
+func validateAllowedIPs(ips []string) error {
+	for _, ip := range ips {
+		ip = strings.TrimSpace(ip)
+		if ip == "" {
+			continue
+		}
+
+		if strings.Contains(ip, "/") {
+			if _, err := netip.ParsePrefix(ip); err != nil {
+				return fmt.Errorf("invalid CIDR %q: %w", ip, err)
+			}
+		} else {
+			if _, err := netip.ParseAddr(ip); err != nil {
+				return fmt.Errorf("invalid IP %q: %w", ip, err)
+			}
 		}
 	}
 
@@ -778,6 +1008,26 @@ func (s *APIKeyService) bulkUpdateAPIKeyStatus(ctx context.Context, ids []int, s
 		return fmt.Errorf("noauth type API key cannot be bulk %sd", action)
 	}
 
+	// Personal API keys can only be managed by their creator
+	personalKeys, err := client.APIKey.Query().
+		Where(apikey.IDIn(ids...), apikey.TypeEQ(apikey.TypePersonal)).
+		All(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to query personal API keys: %w", err)
+	}
+
+	if len(personalKeys) > 0 {
+		user, ok := contexts.GetUser(ctx)
+		if !ok {
+			return fmt.Errorf("user not found in context")
+		}
+		for _, k := range personalKeys {
+			if k.UserID != user.ID {
+				return fmt.Errorf("personal API key %q can only be %sd by its creator", k.Name, action)
+			}
+		}
+	}
+
 	apiKeys, err := client.APIKey.Query().
 		Where(apikey.IDIn(ids...)).
 		All(ctx)
@@ -816,7 +1066,6 @@ func (s *APIKeyService) BulkArchiveAPIKeys(ctx context.Context, ids []int) error
 // RotateAPIKey rotates an API key by generating a new key value while preserving all other properties.
 // This is useful when a key is compromised or when an employee leaves, without losing usage statistics.
 func (s *APIKeyService) RotateAPIKey(ctx context.Context, id int) (*ent.APIKey, error) {
-	// Get the existing API key
 	existing, err := s.db.APIKey.Get(ctx, id)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get API key: %w", err)
@@ -825,6 +1074,16 @@ func (s *APIKeyService) RotateAPIKey(ctx context.Context, id int) (*ent.APIKey, 
 	// Cannot rotate noauth type API key
 	if existing.Type == apikey.TypeNoauth {
 		return nil, fmt.Errorf("noauth type API key cannot be rotated")
+	}
+
+	if existing.Type == apikey.TypePersonal {
+		user, ok := contexts.GetUser(ctx)
+		if !ok {
+			return nil, fmt.Errorf("user not found in context")
+		}
+		if existing.UserID != user.ID {
+			return nil, fmt.Errorf("personal API key can only be rotated by its creator")
+		}
 	}
 
 	// Generate a new API key

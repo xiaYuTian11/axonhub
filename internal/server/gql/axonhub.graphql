@@ -52,10 +52,16 @@ input OverrideMatchInput {
   eq: String!
 }
 
+type ReasoningEffortMapping {
+  from: String!
+  to: String!
+}
+
 type TransformOptions {
   forceArrayInstructions: Boolean!
   forceArrayInputs: Boolean!
   replaceDeveloperRoleWithSystem: Boolean!
+  reasoningEffortMapping: [ReasoningEffortMapping!]
 }
 
 type SyncChannelModelsPayload {
@@ -63,10 +69,16 @@ type SyncChannelModelsPayload {
   supportedModels: [String!]!
 }
 
+input ReasoningEffortMappingInput {
+  from: String!
+  to: String!
+}
+
 input TransformOptionsInput {
   forceArrayInstructions: Boolean
   forceArrayInputs: Boolean
   replaceDeveloperRoleWithSystem: Boolean
+  reasoningEffortMapping: [ReasoningEffortMappingInput!]
 }
 
 enum ProxyType {
@@ -80,6 +92,7 @@ type ProxyConfig {
   url: String
   username: String
   password: String
+  disableConnectionReuse: Boolean
 }
 
 type ChannelEndpoint {
@@ -106,6 +119,7 @@ input ProxyConfigInput {
   url: String
   username: String
   password: String
+  disableConnectionReuse: Boolean
 }
 
 type RetryableErrorPattern {
@@ -116,24 +130,6 @@ type RetryableErrorPattern {
 input RetryableErrorPatternInput {
   pattern: String!
   regex: Boolean
-}
-
-type OpenCodeGoQuotaSettings {
-  workspaceId: String
-  authCookie: String
-}
-
-input OpenCodeGoQuotaSettingsInput {
-  workspaceId: String
-  authCookie: String
-}
-
-type ChannelProviderQuotaSettings {
-  opencodeGo: OpenCodeGoQuotaSettings
-}
-
-input ChannelProviderQuotaSettingsInput {
-  opencodeGo: OpenCodeGoQuotaSettingsInput
 }
 
 type ChannelSettings {
@@ -152,7 +148,6 @@ type ChannelSettings {
   rateLimit: ChannelRateLimit
   retryableStatusCodes: [Int!]
   retryableErrorPatterns: [RetryableErrorPattern!]
-  providerQuota: ChannelProviderQuotaSettings
 }
 
 enum CapabilityPolicy {
@@ -161,12 +156,41 @@ enum CapabilityPolicy {
   forbid
 }
 
+enum APIKeyAutoDisableAction {
+  temporary_disable
+  disable_until_cron
+  permanent_disable
+  permanent_disable_delete
+}
+
+type APIKeyAutoDisableRule {
+  statusCodes: [Int!]
+  keywordPatterns: [String!]
+  times: Int!
+  action: APIKeyAutoDisableAction!
+  disableDurationMinutes: Int
+  disableUntilCron: String
+  disableUntilTimezone: String
+}
+
+input APIKeyAutoDisableRuleInput {
+  statusCodes: [Int!]
+  keywordPatterns: [String!]
+  times: Int!
+  action: APIKeyAutoDisableAction!
+  disableDurationMinutes: Int
+  disableUntilCron: String
+  disableUntilTimezone: String
+}
+
 type ChannelPolicies {
   stream: CapabilityPolicy
+  apiKeyAutoDisableRules: [APIKeyAutoDisableRule!]
 }
 
 input ChannelPoliciesInput {
   stream: CapabilityPolicy
+  apiKeyAutoDisableRules: [APIKeyAutoDisableRuleInput!]
 }
 
 input ModelMappingInput {
@@ -190,7 +214,6 @@ input ChannelSettingsInput {
   rateLimit: ChannelRateLimitInput
   retryableStatusCodes: [Int!]
   retryableErrorPatterns: [RetryableErrorPatternInput!]
-  providerQuota: ChannelProviderQuotaSettingsInput
 }
 
 input ChannelRateLimitInput {
@@ -221,6 +244,7 @@ type DisabledAPIKey {
   disabledAt: Time!
   errorCode: Int!
   reason: String
+  expiresAt: Time
 }
 
 type OAuthCredentials {
@@ -357,6 +381,8 @@ input UpdateAPIKeyProfilesInput {
 
 input APIKeyProfileInput {
   name: String!
+  templateID: Int
+  templateName: String
   modelMappings: [ModelMappingInput!]
   channelIDs: [Int!]
   channelTags: [String!]
@@ -364,6 +390,7 @@ input APIKeyProfileInput {
   modelIDs: [String!]
   quota: APIKeyQuotaInput
   loadBalanceStrategy: String
+  traceStickyMode: String
 }
 
 input UpdateProjectProfilesInput {
@@ -401,6 +428,8 @@ type APIKeyProfiles {
 
 type APIKeyProfile {
   name: String!
+  templateID: Int
+  templateName: String
   modelMappings: [ModelMapping!]
   channelIDs: [Int!]
   channelTags: [String!]
@@ -408,6 +437,7 @@ type APIKeyProfile {
   modelIDs: [String!]
   quota: APIKeyQuota
   loadBalanceStrategy: String
+  traceStickyMode: String
 }
 
 enum ChannelTagsMatchMode {
@@ -417,8 +447,10 @@ enum ChannelTagsMatchMode {
 }
 
 # ApiKeyProfileTemplate uses the Ent-generated type and input types from ent.graphql
-
-
+extend type APIKeyProfileTemplate {
+  """Number of API key profiles that currently follow this template."""
+  linkedProfilesCount: Int!
+}
 
 # Load template input - custom input for loading template to API key
 input LoadApiKeyProfileTemplateInput {
@@ -637,6 +669,7 @@ extend type Trace {
 extend type Thread {
   firstUserQuery: String @goField(forceResolver: true)
   usageMetadata: UsageMetadata @goField(forceResolver: true)
+  archivedTracesCount: Int! @goField(forceResolver: true)
 }
 
 extend type Channel {
@@ -896,6 +929,18 @@ type Mutation {
   loadApiKeyProfileTemplate(
     input: LoadApiKeyProfileTemplateInput!
   ): APIKey!
+
+  # Trace Status Management
+  archiveTrace(id: ID!): Boolean!
+  unarchiveTrace(id: ID!): Boolean!
+  retainTrace(id: ID!): Boolean!
+  unretainTrace(id: ID!): Boolean!
+
+  # Thread Status Management
+  archiveThread(id: ID!): Boolean!
+  unarchiveThread(id: ID!): Boolean!
+  retainThread(id: ID!): Boolean!
+  unretainThread(id: ID!): Boolean!
 }
 
 input QueryChannelInput {

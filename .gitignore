@@ -167,3 +167,5 @@ config.schema.json
 .omc/
 .playwright-mcp/
 .ace-tool/
+.omx/
+deploy_dev.sh

@@ -125,6 +125,7 @@ type RetryPolicy {
   streamFirstEventTimeoutSeconds: Int!
   nonStreamResponseTimeoutSeconds: Int!
   loadBalancerStrategy: String!
+  traceStickyMode: TraceStickyMode!
   enabled: Boolean!
   autoDisableChannel: AutoDisableChannel!
   emptyResponseDetection: Boolean!
@@ -158,10 +159,16 @@ input UpdateRetryPolicyInput {
   streamFirstEventTimeoutSeconds: Int
   nonStreamResponseTimeoutSeconds: Int
   loadBalancerStrategy: String
+  traceStickyMode: TraceStickyMode
   enabled: Boolean
   autoDisableChannel: AutoDisableChannelInput
   emptyResponseDetection: Boolean
   upstreamErrorPolicy: UpstreamErrorPolicyInput
+}
+
+enum TraceStickyMode {
+  DISABLED
+  PREFER_PREVIOUS_CHANNEL
 }
 
 enum QuotaEnforcementMode {
@@ -172,11 +179,33 @@ enum QuotaEnforcementMode {
 type QuotaEnforcementSettings {
   enabled: Boolean!
   mode: QuotaEnforcementMode!
+  allowedChannelIDs: [ID!]!
 }
 
 input UpdateQuotaEnforcementSettingsInput {
   enabled: Boolean
   mode: QuotaEnforcementMode
+  allowedChannelIDs: [ID!]
+}
+
+type ProviderQuotaCollectionProvider {
+  provider: String!
+  enabled: Boolean!
+}
+
+type ProviderQuotaCollectionSettings {
+  enabled: Boolean!
+  providers: [ProviderQuotaCollectionProvider!]!
+}
+
+input ProviderQuotaCollectionProviderInput {
+  provider: String!
+  enabled: Boolean!
+}
+
+input UpdateProviderQuotaCollectionSettingsInput {
+  enabled: Boolean
+  providers: [ProviderQuotaCollectionProviderInput!]
 }
 
 type SecuritySettings {
@@ -195,6 +224,7 @@ type SystemModelSettings {
   defaultModelAPIIncludeAll: Boolean!
   autoReasoningEffort: Boolean!
   modelBlacklistRegex: String!
+  hideUnroutableModelsInList: Boolean!
   developerSettings: [DeveloperModelSettings!]!
 }
 
@@ -204,6 +234,7 @@ input UpdateSystemModelSettingsInput {
   defaultModelAPIIncludeAll: Boolean
   autoReasoningEffort: Boolean
   modelBlacklistRegex: String
+  hideUnroutableModelsInList: Boolean
   developerSettings: [DeveloperModelSettingsInput!]
 }
 
@@ -275,6 +306,8 @@ type ChannelModelAutoSyncSetting {
 type SystemChannelSettings {
   probe: ChannelProbeSetting!
   autoSync: ChannelModelAutoSyncSetting!
+  testSystemPrompt: String!
+  testUserPrompt: String!
 }
 
 input UpdateChannelProbeSettingInput {
@@ -289,6 +322,8 @@ input UpdateChannelModelAutoSyncSettingInput {
 input UpdateSystemChannelSettingsInput {
   probe: UpdateChannelProbeSettingInput
   autoSync: UpdateChannelModelAutoSyncSettingInput
+  testSystemPrompt: String
+  testUserPrompt: String
 }
 
 type SystemGeneralSettings {
@@ -348,6 +383,9 @@ input SaveProxyPresetInput {
 input TriggerGcCleanupInput {
     requestsCleanupDays: Int!
     usageLogsCleanupDays: Int!
+    requestBodiesCleanupDays: Int
+    responseBodiesCleanupDays: Int
+    responseChunksCleanupDays: Int
 }
 
 type GcCleanupPreviewItem {
@@ -371,6 +409,7 @@ extend type Mutation {
   updateSystemGeneralSettings(input: UpdateSystemGeneralSettingsInput!): Boolean!
   updateVideoStorageSettings(input: UpdateVideoStorageSettingsInput!): Boolean!
   updateQuotaEnforcementSettings(input: UpdateQuotaEnforcementSettingsInput!): Boolean!
+  updateProviderQuotaCollectionSettings(input: UpdateProviderQuotaCollectionSettingsInput!): Boolean!
   updateSecuritySettings(input: UpdateSecuritySettingsInput!): Boolean!
   checkProviderQuotas: Boolean!
   resetChannelQuotaNow(channelID: ID!): Boolean!
@@ -435,11 +474,12 @@ extend type Query {
   defaultDataStorageID: ID
   onboardingInfo: OnboardingInfo
   systemVersion: SystemVersion!
-  checkForUpdate: VersionCheck!
+  checkForUpdate(includeBeta: Boolean! = false): VersionCheck!
   systemChannelSettings: SystemChannelSettings!
   systemGeneralSettings: SystemGeneralSettings!
   videoStorageSettings: VideoStorageSettings!
   quotaEnforcementSettings: QuotaEnforcementSettings!
+  providerQuotaCollectionSettings: ProviderQuotaCollectionSettings!
   securitySettings: SecuritySettings!
   proxyPresets: [ProxyPreset!]!
   userAgentPassThroughSettings: UserAgentPassThroughSettings!

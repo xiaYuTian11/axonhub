@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"mime"
 	"net/http"
 	"strings"
 	"text/template"
@@ -29,8 +30,20 @@ type RenderContext struct {
 	Metadata map[string]string `json:"metadata"`
 	// RequestHeader is the filtered request headers used in the current request.
 	RequestHeader map[string]string `json:"request_header"`
+	// PromptCacheKey is the prompt cache key provided by the original request.
+	PromptCacheKey string `json:"prompt_cache_key"`
 	// ReasoningEffort is the reasoning effort used in the current request.
 	ReasoningEffort string `json:"reasoning_effort"`
+}
+
+var overrideTemplateFuncs = template.FuncMap{
+	"toJSON": func(value any) (string, error) {
+		data, err := json.Marshal(value)
+		if err != nil {
+			return "", err
+		}
+		return string(data), nil
+	},
 }
 
 func buildRequestHeaderMap(llmReq *llm.Request) map[string]string {
@@ -58,13 +71,20 @@ func buildRequestHeaderMap(llmReq *llm.Request) map[string]string {
 }
 
 func buildRenderContext(llmReq *llm.Request, requestModel string) RenderContext {
-	return RenderContext{
+	renderCtx := RenderContext{
 		RequestModel:    requestModel,
 		Model:           llmReq.Model,
 		Metadata:        llmReq.Metadata,
 		RequestHeader:   buildRequestHeaderMap(llmReq),
 		ReasoningEffort: llmReq.ReasoningEffort,
 	}
+	if llmReq.PromptCacheKey != nil {
+		renderCtx.PromptCacheKey = *llmReq.PromptCacheKey
+	} else if llmReq.Compact != nil {
+		renderCtx.PromptCacheKey = llmReq.Compact.PromptCacheKey
+	}
+
+	return renderCtx
 }
 
 // renderTemplate renders a Go template string against RenderContext. Returns the original value on error.
@@ -73,7 +93,7 @@ func renderTemplate(ctx context.Context, value string, renderCtx RenderContext) 
 		return value
 	}
 
-	tmpl, err := template.New("override").Funcs(template.FuncMap{}).Parse(value)
+	tmpl, err := template.New("override").Funcs(overrideTemplateFuncs).Parse(value)
 	if err != nil {
 		log.Warn(ctx, "failed to parse override template",
 			log.String("template", value),
@@ -136,6 +156,22 @@ func applyOverrideRequestBody(outbound *PersistentOutboundTransformer) pipeline.
 			return request, nil
 		}
 
+		// Body override operations are implemented with sjson, which silently discards a
+		// non-JSON document and rebuilds it as a fresh JSON object. Applying them to a
+		// multipart body (image edit/variation, transcription, ...) would replace the whole
+		// payload with a tiny JSON object while the Content-Type still advertises the
+		// multipart boundary, so the upstream sees a truncated form.
+		if !bodyOverrideSupported(request) {
+			log.Warn(ctx, "skipping body override operations for non-JSON request body",
+				log.String("channel", channel.Name),
+				log.Int("channel_id", channel.ID),
+				log.String("content_type", requestContentType(request)),
+				log.String("api_format", request.APIFormat),
+			)
+
+			return request, nil
+		}
+
 		llmReq := outbound.state.LlmRequest
 		renderCtx := buildRenderContext(llmReq, outbound.state.OriginalModel)
 		body := request.Body
@@ -179,6 +215,48 @@ func applyOverrideRequestBody(outbound *PersistentOutboundTransformer) pipeline.
 	})
 }
 
+// requestContentType returns the effective outbound Content-Type, preferring the
+// explicit field and falling back to the header.
+func requestContentType(request *httpclient.Request) string {
+	if request == nil {
+		return ""
+	}
+
+	if request.ContentType != "" {
+		return request.ContentType
+	}
+
+	return request.Headers.Get("Content-Type")
+}
+
+// bodyOverrideSupported reports whether channel body override operations can safely be
+// applied to the outbound request body. Only JSON bodies are patchable: sjson treats any
+// non-JSON input as an empty document and returns a freshly built object, which would
+// destroy multipart and binary payloads.
+func bodyOverrideSupported(request *httpclient.Request) bool {
+	if request == nil || len(request.Body) == 0 {
+		return false
+	}
+
+	contentType := requestContentType(request)
+	if contentType != "" {
+		mediaType, _, err := mime.ParseMediaType(contentType)
+		if err == nil && !isJSONMediaType(mediaType) {
+			return false
+		}
+	}
+
+	return gjson.ValidBytes(request.Body)
+}
+
+func isJSONMediaType(mediaType string) bool {
+	mediaType = strings.ToLower(mediaType)
+
+	return mediaType == "application/json" ||
+		mediaType == "text/json" ||
+		strings.HasSuffix(mediaType, "+json")
+}
+
 func applyBodyOperation(
 	ctx context.Context,
 	body []byte,
@@ -192,6 +270,8 @@ func applyBodyOperation(
 	switch op.Op {
 	case objects.OverrideOpSet:
 		return applyBodySet(ctx, body, op, renderCtx)
+	case objects.OverrideOpSetIfAbsent:
+		return applyBodySetIfAbsent(ctx, body, op, renderCtx)
 	case objects.OverrideOpDelete:
 		return applyBodyDelete(body, op)
 	case objects.OverrideOpRename:
@@ -228,6 +308,20 @@ func applyBodySet(
 	}
 
 	return sjson.SetBytes(body, op.Path, renderedValue)
+}
+
+func applyBodySetIfAbsent(
+	ctx context.Context,
+	body []byte,
+	op objects.OverrideOperation,
+	renderCtx RenderContext,
+) ([]byte, error) {
+	existing := gjson.GetBytes(body, op.Path)
+	if existing.Exists() || existing.Raw == "null" {
+		return body, nil
+	}
+
+	return applyBodySet(ctx, body, op, renderCtx)
 }
 
 func applyBodyDelete(body []byte, op objects.OverrideOperation) ([]byte, error) {

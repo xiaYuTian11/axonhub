@@ -393,6 +393,89 @@ func TestOverrideHeadersKeepJSONLikeString(t *testing.T) {
 	require.Equal(t, expectedValue, processedRequest.Headers.Get("Extra"))
 }
 
+func TestOverrideHeadersWithPromptCacheKeyTemplate(t *testing.T) {
+	ctx := context.Background()
+	promptCacheKey := `cache-key-123","admin":true`
+	topLevelPromptCacheKey := "top-level-cache-key"
+
+	tests := []struct {
+		name           string
+		request        *llm.Request
+		expectedHeader string
+	}{
+		{
+			name: "JSON-escapes prompt cache key",
+			request: &llm.Request{
+				Model:          "gpt-5.5",
+				PromptCacheKey: &promptCacheKey,
+			},
+			expectedHeader: `{"session_id":"cache-key-123\",\"admin\":true"}`,
+		},
+		{
+			name:           "skips header when prompt cache key is absent",
+			request:        &llm.Request{Model: "gpt-5.5"},
+			expectedHeader: "",
+		},
+		{
+			name: "uses prompt cache key from compact request",
+			request: &llm.Request{
+				Model:   "gpt-5.5",
+				Compact: &llm.CompactRequest{PromptCacheKey: "compact-cache-key"},
+			},
+			expectedHeader: `{"session_id":"compact-cache-key"}`,
+		},
+		{
+			name: "prefers top-level prompt cache key",
+			request: &llm.Request{
+				Model:          "gpt-5.5",
+				PromptCacheKey: &topLevelPromptCacheKey,
+				Compact:        &llm.CompactRequest{PromptCacheKey: "compact-cache-key"},
+			},
+			expectedHeader: `{"session_id":"top-level-cache-key"}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			channel := &biz.Channel{
+				Channel: &ent.Channel{
+					ID:   1,
+					Name: "prompt-cache-key-template-test",
+					Settings: &objects.ChannelSettings{
+						HeaderOverrideOperations: []objects.OverrideOperation{
+							{
+								Op:        objects.OverrideOpSet,
+								Path:      "Extra",
+								Value:     `{"session_id":{{toJSON .PromptCacheKey}}}`,
+								Condition: `{{if .PromptCacheKey}}true{{end}}`,
+							},
+						},
+					},
+				},
+				Outbound: &mockTransformer{},
+			}
+			outbound := &PersistentOutboundTransformer{
+				wrapped: &mockTransformer{},
+				state: &PersistenceState{
+					CurrentCandidate: &ChannelModelsCandidate{Channel: channel},
+					LlmRequest:       tt.request,
+				},
+			}
+
+			headerMiddleware := applyOverrideRequestHeaders(outbound)
+			processedRequest, err := headerMiddleware.OnOutboundRawRequest(ctx, &httpclient.Request{Headers: make(http.Header)})
+			require.NoError(t, err)
+			actualHeader := processedRequest.Headers.Get("Extra")
+			require.Equal(t, tt.expectedHeader, actualHeader)
+			if tt.expectedHeader != "" {
+				var headerValue map[string]any
+				require.NoError(t, json.Unmarshal([]byte(actualHeader), &headerValue))
+				require.Len(t, headerValue, 1)
+			}
+		})
+	}
+}
+
 func TestOverrideParametersWithRequestHeaderTemplate_NoRawRequest(t *testing.T) {
 	ctx := context.Background()
 
@@ -1849,6 +1932,109 @@ func TestOverrideLegacyFormatCompatibility(t *testing.T) {
 	require.Equal(t, "yes", gjson.Get(bodyStr, "keep").String())
 }
 
+func TestOverrideBodySetIfAbsent(t *testing.T) {
+	ctx := context.Background()
+
+	tests := []struct {
+		name     string
+		body     string
+		op       objects.OverrideOperation
+		metadata map[string]string
+		expected string
+	}{
+		{
+			name:     "sets top-level default when path is absent",
+			body:     `{"model":"gpt-5.5"}`,
+			op:       objects.OverrideOperation{Op: objects.OverrideOpSetIfAbsent, Path: "max_output_tokens", Value: "32000"},
+			expected: `{"model":"gpt-5.5","max_output_tokens":32000}`,
+		},
+		{
+			name:     "preserves existing number",
+			body:     `{"max_output_tokens":8000}`,
+			op:       objects.OverrideOperation{Op: objects.OverrideOpSetIfAbsent, Path: "max_output_tokens", Value: "32000"},
+			expected: `{"max_output_tokens":8000}`,
+		},
+		{
+			name:     "preserves zero",
+			body:     `{"max_output_tokens":0}`,
+			op:       objects.OverrideOperation{Op: objects.OverrideOpSetIfAbsent, Path: "max_output_tokens", Value: "32000"},
+			expected: `{"max_output_tokens":0}`,
+		},
+		{
+			name:     "preserves false",
+			body:     `{"feature":{"enabled":false}}`,
+			op:       objects.OverrideOperation{Op: objects.OverrideOpSetIfAbsent, Path: "feature.enabled", Value: "true"},
+			expected: `{"feature":{"enabled":false}}`,
+		},
+		{
+			name:     "preserves empty string",
+			body:     `{"label":""}`,
+			op:       objects.OverrideOperation{Op: objects.OverrideOpSetIfAbsent, Path: "label", Value: "fallback"},
+			expected: `{"label":""}`,
+		},
+		{
+			name:     "preserves explicit null",
+			body:     `{"max_output_tokens":null}`,
+			op:       objects.OverrideOperation{Op: objects.OverrideOpSetIfAbsent, Path: "max_output_tokens", Value: "32000"},
+			expected: `{"max_output_tokens":null}`,
+		},
+		{
+			name:     "sets nested default when path is absent",
+			body:     `{"generation":{}}`,
+			op:       objects.OverrideOperation{Op: objects.OverrideOpSetIfAbsent, Path: "generation.max_output_tokens", Value: "32000"},
+			expected: `{"generation":{"max_output_tokens":32000}}`,
+		},
+		{
+			name:     "preserves existing nested value",
+			body:     `{"generation":{"max_output_tokens":16000}}`,
+			op:       objects.OverrideOperation{Op: objects.OverrideOpSetIfAbsent, Path: "generation.max_output_tokens", Value: "32000"},
+			expected: `{"generation":{"max_output_tokens":16000}}`,
+		},
+		{
+			name:     "renders template when path is absent",
+			body:     `{}`,
+			op:       objects.OverrideOperation{Op: objects.OverrideOpSetIfAbsent, Path: "max_output_tokens", Value: `{{index .Metadata "default_max"}}`},
+			metadata: map[string]string{"default_max": "64000"},
+			expected: `{"max_output_tokens":64000}`,
+		},
+		{
+			name:     "respects false condition",
+			body:     `{}`,
+			op:       objects.OverrideOperation{Op: objects.OverrideOpSetIfAbsent, Path: "max_output_tokens", Value: "32000", Condition: `{{eq .Model "other-model"}}`},
+			expected: `{}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			llmRequest := &llm.Request{Model: "gpt-5.5", Metadata: tt.metadata}
+			channel := &biz.Channel{
+				Channel: &ent.Channel{
+					ID:   1,
+					Name: "set-if-absent-test",
+					Settings: &objects.ChannelSettings{
+						BodyOverrideOperations: []objects.OverrideOperation{tt.op},
+					},
+				},
+				Outbound: &mockTransformer{},
+			}
+			outbound := &PersistentOutboundTransformer{
+				wrapped: &mockTransformer{},
+				state: &PersistenceState{
+					CurrentCandidate: &ChannelModelsCandidate{Channel: channel},
+					LlmRequest:       llmRequest,
+					OriginalModel:    llmRequest.Model,
+				},
+			}
+
+			middleware := applyOverrideRequestBody(outbound)
+			result, err := middleware.OnOutboundRawRequest(ctx, &httpclient.Request{Body: []byte(tt.body)})
+			require.NoError(t, err)
+			require.JSONEq(t, tt.expected, string(result.Body))
+		})
+	}
+}
+
 func TestParseOverrideOperations(t *testing.T) {
 	t.Run("empty input", func(t *testing.T) {
 		ops, err := objects.ParseOverrideOperations("")
@@ -2202,5 +2388,95 @@ func TestOverrideOperationsArrayOps(t *testing.T) {
 
 		require.Equal(t, int64(1), gjson.Get(got, "tools.#").Int())
 		require.Equal(t, "calculate", gjson.Get(got, "tools.0.function.name").String())
+	})
+}
+
+// TestOverrideBodySkipsNonJSONBody guards the image edit regression: sjson rebuilds a
+// non-JSON document from scratch, so applying body overrides to a multipart payload used
+// to replace the whole form with a tiny JSON object while Content-Type still advertised
+// the multipart boundary, producing a truncated upstream request.
+func TestOverrideBodySkipsNonJSONBody(t *testing.T) {
+	ctx := context.Background()
+
+	multipartBody := []byte("--boundary123\r\n" +
+		"Content-Disposition: form-data; name=\"image\"; filename=\"image_1.png\"\r\n" +
+		"Content-Type: image/png\r\n\r\n" +
+		"\x89PNG\r\n\x1a\nbinary-image-bytes\r\n" +
+		"--boundary123\r\n" +
+		"Content-Disposition: form-data; name=\"prompt\"\r\n\r\n" +
+		"make it blue\r\n" +
+		"--boundary123--\r\n")
+
+	newOutbound := func() *PersistentOutboundTransformer {
+		channel := &biz.Channel{
+			Channel: &ent.Channel{
+				ID:              1,
+				Name:            "test-channel",
+				SupportedModels: []string{"gpt-image-1"},
+				Settings: &objects.ChannelSettings{
+					BodyOverrideOperations: []objects.OverrideOperation{
+						{Op: objects.OverrideOpSet, Path: "response_format", Value: "b64_json"},
+					},
+				},
+			},
+			Outbound: &mockTransformer{},
+		}
+
+		return &PersistentOutboundTransformer{
+			wrapped: &mockTransformer{},
+			state: &PersistenceState{
+				CurrentCandidate:      &ChannelModelsCandidate{Channel: channel},
+				CurrentCandidateIndex: 0,
+				CurrentModelIndex:     0,
+				LlmRequest:            &llm.Request{Model: "gpt-image-1"},
+			},
+		}
+	}
+
+	t.Run("multipart body is left untouched", func(t *testing.T) {
+		headers := make(http.Header)
+		headers.Set("Content-Type", "multipart/form-data; boundary=boundary123")
+
+		request := &httpclient.Request{
+			Method:      "POST",
+			URL:         "https://api.example.com/v1/images/edits",
+			Headers:     headers,
+			ContentType: "multipart/form-data; boundary=boundary123",
+			Body:        multipartBody,
+		}
+
+		modified, err := applyOverrideRequestBody(newOutbound()).OnOutboundRawRequest(ctx, request)
+		require.NoError(t, err)
+		require.Equal(t, multipartBody, modified.Body)
+	})
+
+	t.Run("multipart body without explicit content type is left untouched", func(t *testing.T) {
+		request := &httpclient.Request{
+			Method: "POST",
+			URL:    "https://api.example.com/v1/images/edits",
+			Body:   multipartBody,
+		}
+
+		modified, err := applyOverrideRequestBody(newOutbound()).OnOutboundRawRequest(ctx, request)
+		require.NoError(t, err)
+		require.Equal(t, multipartBody, modified.Body)
+	})
+
+	t.Run("json body still gets overridden", func(t *testing.T) {
+		headers := make(http.Header)
+		headers.Set("Content-Type", "application/json")
+
+		request := &httpclient.Request{
+			Method:      "POST",
+			URL:         "https://api.example.com/v1/images/generations",
+			Headers:     headers,
+			ContentType: "application/json",
+			Body:        []byte(`{"model":"gpt-image-1","prompt":"a cat"}`),
+		}
+
+		modified, err := applyOverrideRequestBody(newOutbound()).OnOutboundRawRequest(ctx, request)
+		require.NoError(t, err)
+		require.Equal(t, "b64_json", gjson.GetBytes(modified.Body, "response_format").String())
+		require.Equal(t, "a cat", gjson.GetBytes(modified.Body, "prompt").String())
 	})
 }

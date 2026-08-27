@@ -233,7 +233,7 @@ func (svc *ChannelOverrideTemplateService) ApplyTemplate(
 	}
 
 	if svc.channelService != nil {
-		svc.channelService.asyncReloadChannels()
+		svc.channelService.reloadChannelsAfterCommit(ctx)
 	}
 
 	return updated, nil
@@ -290,7 +290,7 @@ func (svc *ChannelOverrideTemplateService) ClearTemplates(
 	}
 
 	if svc.channelService != nil {
-		svc.channelService.asyncReloadChannels()
+		svc.channelService.reloadChannelsAfterCommit(ctx)
 	}
 
 	return updated, nil
@@ -330,39 +330,47 @@ func getBodyOverrideOperations(settings *objects.ChannelSettings) []objects.Over
 }
 
 // MergeOverrideOperations merges existing body operations with template operations.
-// - For set/delete ops, matching is by Path. Template overrides existing.
+// - For set/set_if_absent/delete ops, template paths replace matching existing operations.
+// - Template operations remain ordered because multiple conditions at the same path are meaningful.
 // - For rename/copy and array_* ops, they are always appended (multiple of the same path are meaningful).
 // - Existing ops not mentioned in the template are preserved.
 func MergeOverrideOperations(existing, template []objects.OverrideOperation) []objects.OverrideOperation {
 	result := make([]objects.OverrideOperation, 0, len(existing)+len(template))
-	result = append(result, existing...)
-
+	templateOpsByPath := make(map[string][]objects.OverrideOperation, len(template))
 	for _, op := range template {
-		switch op.Op {
-		case objects.OverrideOpRename, objects.OverrideOpCopy,
-			objects.OverrideOpArrayAppend, objects.OverrideOpArrayPrepend, objects.OverrideOpArrayInsert:
-			result = append(result, op)
-			continue
-		}
-
-		found := false
-
-		for i := range result {
-			if (result[i].Op == objects.OverrideOpSet || result[i].Op == objects.OverrideOpDelete) &&
-				result[i].Path == op.Path {
-				result[i] = op
-				found = true
-
-				break
-			}
-		}
-
-		if !found {
-			result = append(result, op)
+		if isReplacingBodyOverrideOperation(op.Op) {
+			templateOpsByPath[op.Path] = append(templateOpsByPath[op.Path], op)
 		}
 	}
 
+	emittedTemplatePaths := make(map[string]struct{}, len(templateOpsByPath))
+	for _, op := range existing {
+		if isReplacingBodyOverrideOperation(op.Op) {
+			if replacements, ok := templateOpsByPath[op.Path]; ok {
+				if _, emitted := emittedTemplatePaths[op.Path]; !emitted {
+					result = append(result, replacements...)
+					emittedTemplatePaths[op.Path] = struct{}{}
+				}
+				continue
+			}
+		}
+		result = append(result, op)
+	}
+
+	for _, op := range template {
+		if isReplacingBodyOverrideOperation(op.Op) {
+			if _, emitted := emittedTemplatePaths[op.Path]; emitted {
+				continue
+			}
+		}
+		result = append(result, op)
+	}
+
 	return result
+}
+
+func isReplacingBodyOverrideOperation(op string) bool {
+	return op == objects.OverrideOpSet || op == objects.OverrideOpSetIfAbsent || op == objects.OverrideOpDelete
 }
 
 // QueryChannelOverrideTemplatesInput represents the input for querying templates.

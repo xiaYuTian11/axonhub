@@ -5,9 +5,10 @@ import { z } from 'zod';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { X, RefreshCw, Search, ChevronLeft, ChevronRight, PanelLeft, Plus, Trash2, Eye, EyeOff, Copy, Play, Info } from 'lucide-react';
+import { X, RefreshCw, Search, ChevronLeft, ChevronRight, PanelLeft, Plus, Trash2, Eye, EyeOff, Copy, Play, Info, Ban } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
+import { useHorizontalScroll } from '@/hooks/use-horizontal-scroll';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
@@ -25,6 +26,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import { AutoCompleteSelect } from '@/components/auto-complete-select';
 import { SelectDropdown } from '@/components/select-dropdown';
 import { useProxyPresets, useSaveProxyPreset } from '@/features/system/data/system';
+import { usePermissions } from '@/hooks/usePermissions';
 import { antigravityOAuthExchange, antigravityOAuthStart } from '../data/antigravity';
 import {
   useCreateChannel,
@@ -34,10 +36,13 @@ import {
   useAllChannelNames,
   useAllChannelTags,
   useChannelDisabledAPIKeys,
+  useDisableChannelAPIKey,
+  useEnableChannelAPIKey,
   useSyncChannelModels,
 } from '../data/channels';
 import { claudecodeOAuthExchange, claudecodeOAuthStart } from '../data/claudecode';
 import { codexDecodeAuthJSON, codexOAuthExchange, codexOAuthStart } from '../data/codex';
+import { xaiDecodeSSO, xaiOAuthExchange, xaiOAuthStart } from '../data/xai';
 import {
   getDefaultBaseURL,
   getDefaultModels,
@@ -174,10 +179,6 @@ function getResponsesWebSocketBaseURL(channelType: ChannelType): string | undefi
   return undefined;
 }
 
-function isOpenCodeGoChannelType(channelType: ChannelType | undefined): channelType is 'opencode_go' | 'opencode_go_anthropic' {
-  return channelType === 'opencode_go' || channelType === 'opencode_go_anthropic';
-}
-
 // Custom hook for debounced value
 function useDebounce<T>(value: T, delay: number): T {
   const [debouncedValue, setDebouncedValue] = useState<T>(value);
@@ -287,7 +288,7 @@ function getNextDuplicateName(name: string, existingNames: Set<string>) {
 }
 
 // Providers that are always OAuth (no third-party API key mode)
-const alwaysOAuthProviderKeys = ['antigravity', 'github_copilot'];
+const alwaysOAuthProviderKeys = ['antigravity', 'github_copilot', 'xai_subscription'];
 
 function isOfficialCodexChannel(channel: { credentials?: { apiKey?: string } }): boolean {
   try {
@@ -330,6 +331,7 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
   const { data: allTags = [], isLoading: isLoadingTags } = useAllChannelTags();
   const { data: proxyPresets = [] } = useProxyPresets();
   const saveProxyPreset = useSaveProxyPreset();
+  const { hasSystemScope } = usePermissions();
   const [supportedModels, setSupportedModels] = useState<string[]>(() => initialRow?.supportedModels || []);
   const [manualModels, setManualModels] = useState<string[]>(() => initialRow?.manualModels || []);
   const [newModel, setNewModel] = useState('');
@@ -338,6 +340,7 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
   const [useFetchedModels, setUseFetchedModels] = useState(false);
   const providerRefs = useRef<Record<string, HTMLDivElement | null>>({});
   const providerListRef = useRef<HTMLDivElement | null>(null);
+  const providerHorizontalScrollRef = useHorizontalScroll<HTMLDivElement>();
 
   // Expandable panel states
   const [showFetchedModelsPanel, setShowFetchedModelsPanel] = useState(false);
@@ -356,9 +359,11 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
   const [selectedKeysToRemove, setSelectedKeysToRemove] = useState<Set<string>>(new Set());
   const [confirmRemoveSelectedOpen, setConfirmRemoveSelectedOpen] = useState(false);
   const [confirmRemoveKey, setConfirmRemoveKey] = useState<string | null>(null);
-  const [showOpenCodeGoAuthCookie, setShowOpenCodeGoAuthCookie] = useState(false);
+  const [confirmDisableKey, setConfirmDisableKey] = useState<string | null>(null);
   const [authMode, setAuthMode] = useState<'official' | 'auth-json' | 'third-party'>('official');
   const [codexAuthJSONText, setCodexAuthJSONText] = useState('');
+  const [xaiSSOToken, setXaiSSOToken] = useState('');
+  const [isImportingXAISSO, setIsImportingXAISSO] = useState(false);
   const [patternError, setPatternError] = useState<string | null>(null);
 
   // Debounced search values for better performance
@@ -434,6 +439,15 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
     },
   });
 
+  const xaiOAuth = useOAuthFlow({
+    startFn: xaiOAuthStart,
+    exchangeFn: xaiOAuthExchange,
+    proxyConfig,
+    onSuccess: (credentials) => {
+      form.setValue('credentials.apiKey', credentials);
+    },
+  });
+
   const antigravityOAuth = useOAuthFlow({
     startFn: antigravityOAuthStart,
     exchangeFn: antigravityOAuthExchange,
@@ -503,9 +517,11 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
       codexOAuth.reset();
       claudecodeOAuth.reset();
       antigravityOAuth.reset();
+      xaiOAuth.reset();
       setCodexAuthJSONText('');
+      setXaiSSOToken('');
     }
-  }, [open, codexOAuth, claudecodeOAuth, antigravityOAuth]);
+  }, [open, codexOAuth.reset, claudecodeOAuth.reset, antigravityOAuth.reset, xaiOAuth.reset]);
 
   useEffect(() => {
     if (!open) {
@@ -515,7 +531,7 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
       setSelectedKeysToRemove(new Set());
       setConfirmRemoveSelectedOpen(false);
       setConfirmRemoveKey(null);
-      setShowOpenCodeGoAuthCookie(false);
+      setConfirmDisableKey(null);
       setPatternError(null);
       setFetchedModels([]);
       setUseFetchedModels(false);
@@ -538,19 +554,30 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
       const target = providerRefs.current[selectedProvider];
       const container = providerListRef.current;
       if (target && container) {
-        const containerHeight = container.clientHeight;
-        const targetOffsetTop = target.offsetTop;
-        const targetHeight = target.clientHeight;
-
-        const targetCenter = targetOffsetTop + targetHeight / 2;
-        const scrollTop = targetCenter - containerHeight / 2;
-
-        container.scrollTop = Math.max(0, scrollTop);
+        const isHorizontal =
+          (window.getComputedStyle(container).overflowX === 'auto' ||
+            window.getComputedStyle(container).overflowX === 'scroll') &&
+          container.scrollWidth > container.clientWidth;
+        if (isHorizontal) {
+          const targetCenter = target.offsetLeft + target.clientWidth / 2;
+          container.scrollLeft = Math.max(0, targetCenter - container.clientWidth / 2);
+        } else {
+          const targetCenter = target.offsetTop + target.clientHeight / 2;
+          container.scrollTop = Math.max(0, targetCenter - container.clientHeight / 2);
+        }
       }
     }, 100);
 
     return () => clearTimeout(timer);
   }, [open, isEdit, selectedProvider]);
+
+  const setProviderListRef = useCallback(
+    (el: HTMLDivElement | null) => {
+      providerListRef.current = el;
+      providerHorizontalScrollRef(el);
+    },
+    [providerHorizontalScrollRef]
+  );
 
   // Auto-open supported models panel when showModelsPanel is true
   useEffect(() => {
@@ -658,7 +685,7 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
             tags: currentRow.tags || [],
             remark: currentRow.remark || '',
             credentials: {
-              // OAuth 类型 (codex/claudecode/antigravity) 的凭据存储在 apiKey 字段，不放入 apiKeys
+              // OAuth 类型的凭据存储在 apiKey 字段，不放入 apiKeys
               apiKey: currentRow.credentials?.apiKey || undefined,
               apiKeys: currentRow.credentials?.apiKeys || [],
               gcp: {
@@ -683,7 +710,7 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
               remark: duplicateFromRow.remark || '',
               settings: duplicateFromRow.settings ?? undefined,
               credentials: {
-                // OAuth 类型 (codex/claudecode/antigravity) 的凭据存储在 apiKey 字段，不放入 apiKeys
+                // OAuth 类型的凭据存储在 apiKey 字段，不放入 apiKeys
                 apiKey: duplicateFromRow.credentials?.apiKey || undefined,
                 apiKeys: duplicateFromRow.credentials?.apiKeys || [],
                 gcp: {
@@ -718,11 +745,20 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
   const apiKeysCount = useMemo(() => (apiKeys || []).filter((k) => k.trim().length > 0).length, [apiKeys]);
   const isSubmitting = createChannel.isPending || duplicateChannel.isPending || updateChannel.isPending;
 
-  const { data: disabledKeys = [] } = useChannelDisabledAPIKeys(currentRow?.id || '', {
+  const { data: disabledKeys = [], isFetching: isFetchingDisabledKeys } = useChannelDisabledAPIKeys(currentRow?.id || '', {
     enabled: isEdit && !!currentRow?.id && showApiKeysPanel,
   });
 
   const disabledKeySet = useMemo(() => new Set(disabledKeys.map((dk) => dk.key)), [disabledKeys]);
+
+  // Keys that exist in the backend (used to hide disable/enable button for unsaved new keys)
+  const savedAPIKeySet = useMemo(
+    () => new Set((currentRow?.credentials?.apiKeys || []).filter((k) => k.trim().length > 0)),
+    [currentRow?.credentials?.apiKeys]
+  );
+
+  const disableAPIKey = useDisableChannelAPIKey();
+  const enableAPIKey = useEnableChannelAPIKey();
 
   useEffect(() => {
     if (!open || !isDuplicate || !duplicateFromRow) return;
@@ -745,9 +781,10 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
   const activeChannelType = selectedType || derivedChannelType;
   const isCodexType = activeChannelType === 'codex';
   const isAntigravityType = activeChannelType === 'antigravity';
+  const isClineType = activeChannelType === 'cline';
   const isClaudeCodeType = activeChannelType === 'claudecode';
   const isCopilotType = activeChannelType === 'github_copilot';
-  const isOpenCodeGoType = isOpenCodeGoChannelType(activeChannelType);
+  const isXAISubscriptionType = activeChannelType === 'xai_subscription';
 
   // OAuth providers cannot have their provider/API format changed during edit.
   // Derived from currentRow credentials so it stays stable across re-renders
@@ -815,6 +852,21 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
         form.setValue('type', 'codex');
         if (!isEdit) {
           const baseURL = responsesTransport === 'websocket' ? getResponsesWebSocketBaseURL('codex') : getDefaultBaseURL('codex');
+          if (baseURL) {
+            form.setValue('baseURL', baseURL, { shouldDirty: true });
+          }
+          setFetchedModels([]);
+          setUseFetchedModels(false);
+        }
+        return;
+      }
+
+      if (provider === 'xai_subscription') {
+        setSelectedApiFormat(OPENAI_RESPONSES);
+        setResponsesTransport('http');
+        form.setValue('type', 'xai_subscription');
+        if (!isEdit) {
+          const baseURL = getDefaultBaseURL('xai_subscription');
           if (baseURL) {
             form.setValue('baseURL', baseURL, { shouldDirty: true });
           }
@@ -1023,11 +1075,16 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
     if (selectedProvider !== 'antigravity') {
       antigravityOAuth.reset();
     }
+    if (selectedProvider !== 'xai_subscription') {
+      xaiOAuth.reset();
+      setXaiSSOToken('');
+    }
 
     const providerToChannelType: Partial<Record<string, ChannelType>> = {
       claudecode: authMode === 'official' ? 'claudecode' : undefined,
       codex: authMode === 'official' || authMode === 'auth-json' ? 'codex' : undefined,
       antigravity: 'antigravity',
+      xai_subscription: 'xai_subscription',
     };
 
     const channelTypeForURL: ChannelType | undefined = providerToChannelType[selectedProvider];
@@ -1052,9 +1109,10 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
     selectedProvider,
     authMode,
     form,
-    codexOAuth,
-    claudecodeOAuth,
-    antigravityOAuth,
+    codexOAuth.reset,
+    claudecodeOAuth.reset,
+    antigravityOAuth.reset,
+    xaiOAuth.reset,
     responsesTransport,
   ]);
 
@@ -1122,6 +1180,33 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
     [t]
   );
 
+  const applyXAISSO = useCallback(async () => {
+    const token = xaiSSOToken.trim();
+    if (!token) {
+      toast.error(t('channels.dialogs.xaiSso.errors.required'));
+      return;
+    }
+
+    setIsImportingXAISSO(true);
+    try {
+      const result = await xaiDecodeSSO({
+        sso_token: token,
+        ...(proxyConfig ? { proxy: proxyConfig } : {}),
+      });
+      form.setValue('credentials.apiKey', result.credentials, {
+        shouldDirty: true,
+        shouldTouch: true,
+        shouldValidate: true,
+      });
+      setXaiSSOToken('');
+      toast.success(t('channels.dialogs.xaiSso.messages.imported'));
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error));
+    } finally {
+      setIsImportingXAISSO(false);
+    }
+  }, [form, proxyConfig, t, xaiSSOToken]);
+
   const applyCodexAuthJSON = useCallback(async () => {
     try {
       const result = await codexDecodeAuthJSON({ auth_json: codexAuthJSONText });
@@ -1173,16 +1258,12 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
         manualModels,
         credentials: valuesForSubmit.credentials,
       };
-      const settingsForSubmit = isOpenCodeGoChannelType(dataWithModels.type as ChannelType | undefined)
-        ? values.settings
-        : {
-            ...(values.settings ?? {}),
-            providerQuota: null,
-          };
+      const settingsForSubmit = values.settings;
 
       const shouldUseProtocolDefaultBaseURL =
-        (isCodexType && (!isEdit || authMode === 'official' || authMode === 'auth-json')) ||
-        (isClaudeCodeType && authMode === 'official' && !isDuplicate);
+        (isCodexType && (authMode === 'official' || authMode === 'auth-json')) ||
+        (isClaudeCodeType && authMode === 'official' && !isDuplicate) ||
+        isXAISubscriptionType;
       if (shouldUseProtocolDefaultBaseURL) {
         const currentType = selectedType || derivedChannelType;
         const baseURL =
@@ -1211,7 +1292,7 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
         const updateInput = {
           ...dataWithModels,
           settings: nextSettings,
-          ...(isOAuthChannel ? { type: undefined } : {}),
+          ...(isOAuthChannel ? { type: currentRow.type } : {}),
         } as z.infer<typeof updateChannelInputSchema>;
 
         const apiKey = values.credentials?.apiKey || '';
@@ -1267,7 +1348,7 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
         }
 
         // Auto-save proxy preset (preserve existing name if available)
-        if (proxyType === ProxyType.URL && proxyUrl) {
+        if (hasSystemScope('write_settings') && proxyType === ProxyType.URL && proxyUrl) {
           const existingPreset = proxyPresets.find((p) => p.url === proxyUrl);
           saveProxyPreset.mutate({
             name: existingPreset?.name,
@@ -1455,7 +1536,7 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
     const apiKeys = form.watch('credentials.apiKeys');
     const hasApiKey = apiKeys?.some((key) => key.trim().length > 0);
 
-    if (isCodexType || isAntigravityType) {
+    if (isCodexType || isAntigravityType || isClineType || isXAISubscriptionType) {
       return !!baseURL;
     }
 
@@ -1564,6 +1645,7 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
     setSelectedKeysToRemove(new Set());
     setConfirmRemoveSelectedOpen(false);
     setConfirmRemoveKey(null);
+    setConfirmDisableKey(null);
   }, []);
 
   const removeApiKeys = useCallback(
@@ -1664,8 +1746,8 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
             setSelectedKeysToRemove(new Set());
             setConfirmRemoveSelectedOpen(false);
             setConfirmRemoveKey(null);
+            setConfirmDisableKey(null);
             setShowApiKey(false);
-            setShowOpenCodeGoAuthCookie(false);
             // Reset proxy state
             if (initialRow?.settings?.proxy?.type) {
               setProxyType(initialRow.settings.proxy.type as ProxyType);
@@ -1721,14 +1803,14 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
                       <FormItem className='flex min-h-0 flex-1 flex-col space-y-2'>
                         <FormLabel className='text-base font-semibold'>{t('channels.dialogs.fields.provider.label')}</FormLabel>
                         <div
-                          ref={providerListRef}
-                          className={`flex-1 overflow-y-auto pr-2 ${isOAuthChannel ? 'cursor-not-allowed opacity-60' : ''}`}
+                          ref={setProviderListRef}
+                          className={`flex-1 overflow-x-auto overflow-y-hidden pb-2 md:overflow-x-hidden md:overflow-y-auto md:pb-0 md:pr-2 ${isOAuthChannel ? 'cursor-not-allowed opacity-60' : ''}`}
                         >
                           <RadioGroup
                             value={selectedProvider}
                             onValueChange={handleProviderChange}
                             disabled={!!isOAuthChannel}
-                            className='space-y-2'
+                            className='flex flex-row gap-2 md:flex-col md:space-y-2'
                           >
                             {availableProviders.map((provider) => {
                               const Icon = provider.icon;
@@ -1741,7 +1823,7 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
                                   ref={(el) => {
                                     providerRefs.current[provider.key] = el;
                                   }}
-                                  className={`flex items-center space-x-3 rounded-lg border p-3 transition-colors ${
+                                  className={`flex items-center space-x-3 rounded-lg border p-3 transition-colors shrink-0 md:w-full ${
                                     isProviderDisabled
                                       ? isSelected
                                         ? 'border-primary bg-muted/80 cursor-not-allowed shadow-sm'
@@ -1756,7 +1838,7 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
                                     data-testid={`provider-${provider.key}`}
                                   />
                                   {Icon && <Icon size={20} className='flex-shrink-0' />}
-                                  <FormLabel htmlFor={`provider-${provider.key}`} className='flex-1 cursor-pointer font-normal'>
+                                  <FormLabel htmlFor={`provider-${provider.key}`} className='flex-1 cursor-pointer whitespace-nowrap font-normal'>
                                     {provider.label}
                                   </FormLabel>
                                 </div>
@@ -2131,6 +2213,42 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
                         </div>
                       )}
 
+                      {isXAISubscriptionType && (
+                        <div className='grid grid-cols-1 items-start gap-x-6 gap-y-2 md:grid-cols-8'>
+                          <div className='col-span-2' />
+                          <div className='space-y-4 md:col-span-6'>
+                            {renderOAuthSection(xaiOAuth, t('channels.dialogs.fields.apiFormat.xaiSubscription.description'))}
+                            <div className='rounded-md border p-3'>
+                              <div className='space-y-2'>
+                                <FormLabel htmlFor='xai-sso-token' className='text-sm font-medium'>
+                                  {t('channels.dialogs.xaiSso.label')}
+                                </FormLabel>
+                                <Textarea
+                                  id='xai-sso-token'
+                                  value={xaiSSOToken}
+                                  onChange={(event) => setXaiSSOToken(event.target.value)}
+                                  spellCheck={false}
+                                  autoComplete='off'
+                                  placeholder={t('channels.dialogs.xaiSso.placeholder')}
+                                  className='min-h-[96px] resize-y font-mono text-xs'
+                                />
+                                <Button
+                                  type='button'
+                                  variant='secondary'
+                                  onClick={applyXAISSO}
+                                  disabled={isImportingXAISSO || !xaiSSOToken.trim()}
+                                >
+                                  {isImportingXAISSO
+                                    ? t('channels.dialogs.xaiSso.buttons.importing')
+                                    : t('channels.dialogs.xaiSso.buttons.import')}
+                                </Button>
+                                <p className='text-muted-foreground text-xs'>{t('channels.dialogs.xaiSso.description')}</p>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
                       <FormField
                         control={form.control}
                         name='baseURL'
@@ -2147,7 +2265,10 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
                                 aria-invalid={!!fieldState.error}
                                 data-testid='channel-base-url-input'
                                 disabled={
-                                  (isCodexType && authMode !== 'third-party') || (isClaudeCodeType && authMode === 'official') || selectedProvider === 'antigravity'
+                                  (isCodexType && authMode !== 'third-party') ||
+                                  (isClaudeCodeType && authMode === 'official') ||
+                                  isXAISubscriptionType ||
+                                  selectedProvider === 'antigravity'
                                 }
                                 {...field}
                               />
@@ -2157,7 +2278,7 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
                         )}
                       />
 
-                      {(!(isCodexType || isClaudeCodeType || isCopilotType) || authMode === 'third-party') &&
+                      {(!(isCodexType || isClaudeCodeType || isCopilotType || isXAISubscriptionType) || authMode === 'third-party') &&
                         selectedProvider !== 'antigravity' &&
                         selectedType !== 'anthropic_gcp' && (
                           <FormField
@@ -2294,79 +2415,6 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
                             )}
                           />
                         )}
-
-                      {isOpenCodeGoType && (
-                        <>
-                          <FormField
-                            control={form.control}
-                            name='settings.providerQuota.opencodeGo.workspaceId'
-                            render={({ field }) => (
-                              <FormItem className='grid grid-cols-1 items-start gap-x-6 gap-y-2 md:grid-cols-8'>
-                                <FormLabel className='pt-2 font-medium md:col-span-2 md:text-right'>
-                                  {t('channels.dialogs.fields.opencodeGoQuota.workspaceId.label')}
-                                </FormLabel>
-                                <div className='space-y-1 md:col-span-6'>
-                                  <Input
-                                    placeholder={t('channels.dialogs.fields.opencodeGoQuota.workspaceId.placeholder')}
-                                    autoComplete='off'
-                                    spellCheck={false}
-                                    className='font-mono text-sm'
-                                    data-testid='channel-opencode-go-workspace-id-input'
-                                    {...field}
-                                    value={field.value ?? ''}
-                                  />
-                                  <p className='text-muted-foreground text-xs'>
-                                    {t('channels.dialogs.fields.opencodeGoQuota.workspaceId.description')}
-                                  </p>
-                                  <FormMessage />
-                                </div>
-                              </FormItem>
-                            )}
-                          />
-
-                          <FormField
-                            control={form.control}
-                            name='settings.providerQuota.opencodeGo.authCookie'
-                            render={({ field, fieldState }) => (
-                              <FormItem className='grid grid-cols-1 items-start gap-x-6 gap-y-2 md:grid-cols-8'>
-                                <FormLabel className='pt-2 font-medium md:col-span-2 md:text-right'>
-                                  {t('channels.dialogs.fields.opencodeGoQuota.authCookie.label')}
-                                </FormLabel>
-                                <div className='space-y-1 md:col-span-6'>
-                                  <div className='relative'>
-                                    <Input
-                                      type={showOpenCodeGoAuthCookie ? 'text' : 'password'}
-                                      placeholder={t('channels.dialogs.fields.opencodeGoQuota.authCookie.placeholder')}
-                                      autoComplete='new-password'
-                                      data-form-type='other'
-                                      spellCheck={false}
-                                      className='pr-10 font-mono text-sm'
-                                      aria-invalid={!!fieldState.error}
-                                      data-testid='channel-opencode-go-auth-cookie-input'
-                                      {...field}
-                                      value={field.value ?? ''}
-                                    />
-                                    <Button
-                                      type='button'
-                                      variant='ghost'
-                                      size='sm'
-                                      className='absolute top-1/2 right-1 h-7 w-7 -translate-y-1/2 p-0'
-                                      aria-label={t('channels.dialogs.fields.opencodeGoQuota.authCookie.toggleVisibility')}
-                                      onClick={() => setShowOpenCodeGoAuthCookie((visible) => !visible)}
-                                    >
-                                      {showOpenCodeGoAuthCookie ? <EyeOff className='h-4 w-4' /> : <Eye className='h-4 w-4' />}
-                                    </Button>
-                                  </div>
-                                  <p className='text-muted-foreground text-xs'>
-                                    {t('channels.dialogs.fields.opencodeGoQuota.authCookie.description')}
-                                  </p>
-                                  <FormMessage />
-                                </div>
-                              </FormItem>
-                            )}
-                          />
-                        </>
-                      )}
 
                       <FormField
                         control={form.control}
@@ -2946,6 +2994,7 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
                     {(() => {
                       const validKeys = (apiKeys || []).map((k) => k.trim()).filter((k) => k.length > 0);
                       const isLastKey = validKeys.length <= 1;
+                      const enabledKeysCount = validKeys.filter((k) => savedAPIKeySet.has(k) && !disabledKeySet.has(k)).length;
                       return validKeys
                         .filter((k) => {
                           if (!apiKeysSearch.trim()) return true;
@@ -2955,6 +3004,7 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
                         .map((key) => {
                           const isSelected = selectedKeysToRemove.has(key);
                           const isDisabled = disabledKeySet.has(key);
+                          const isSavedKey = savedAPIKeySet.has(key);
                           const masked = key.length > 8 ? `${key.slice(0, 4)}****${key.slice(-4)}` : `****${key.slice(-4)}`;
 
                           return (
@@ -2992,50 +3042,133 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
                                 </div>
                               </div>
 
-                              {isLastKey ? (
-                                <Tooltip>
-                                  <TooltipTrigger asChild>
-                                    <span className='inline-flex'>
-                                      <Button
-                                        type='button'
-                                        variant='ghost'
-                                        size='sm'
-                                        className='text-muted-foreground h-7 w-7 p-0'
-                                        disabled
-                                      >
+                              <div className='flex items-center gap-1'>
+                                {/* Disable / Enable button — only for keys saved in backend */}
+                                {isSavedKey &&
+                                  (isDisabled ? (
+                                    <Popover
+                                      open={confirmDisableKey === key}
+                                      onOpenChange={(isOpen) => setConfirmDisableKey(isOpen ? key : null)}
+                                    >
+                                      <PopoverTrigger asChild>
+                                        <Button type='button' variant='ghost' size='sm' className='h-7 w-7 p-0'>
+                                          <RefreshCw className='h-4 w-4' />
+                                        </Button>
+                                      </PopoverTrigger>
+                                      <PopoverContent className='w-72'>
+                                        <div className='flex flex-col gap-3'>
+                                          <p className='text-sm'>{t('channels.dialogs.fields.apiKey.confirmEnable')}</p>
+                                          <div className='flex justify-end gap-2'>
+                                            <Button size='sm' variant='outline' onClick={() => setConfirmDisableKey(null)}>
+                                              {t('common.buttons.cancel')}
+                                            </Button>
+                                            <Button
+                                              size='sm'
+                                              onClick={async () => {
+                                                if (!currentRow?.id) return;
+                                                await enableAPIKey.mutateAsync({ channelID: currentRow.id, key });
+                                                setConfirmDisableKey(null);
+                                              }}
+                                            >
+                                              {t('common.buttons.confirm')}
+                                            </Button>
+                                          </div>
+                                        </div>
+                                      </PopoverContent>
+                                    </Popover>
+                                  ) : enabledKeysCount <= 1 ? (
+                                    <Tooltip>
+                                      <TooltipTrigger asChild>
+                                        <span className='inline-flex'>
+                                          <Button type='button' variant='ghost' size='sm' className='text-muted-foreground h-7 w-7 p-0' disabled>
+                                            <Ban className='h-4 w-4' />
+                                          </Button>
+                                        </span>
+                                      </TooltipTrigger>
+                                      <TooltipContent>
+                                        <p>{t('channels.dialogs.fields.apiKey.mustKeepOneEnabled')}</p>
+                                      </TooltipContent>
+                                    </Tooltip>
+                                  ) : (
+                                    <Popover
+                                      open={confirmDisableKey === key}
+                                      onOpenChange={(isOpen) => setConfirmDisableKey(isOpen ? key : null)}
+                                    >
+                                      <PopoverTrigger asChild>
+                                        <Button type='button' variant='ghost' size='sm' className='text-orange-500 h-7 w-7 p-0' disabled={disableAPIKey.isPending || isFetchingDisabledKeys}>
+                                          <Ban className='h-4 w-4' />
+                                        </Button>
+                                      </PopoverTrigger>
+                                      <PopoverContent className='w-72'>
+                                        <div className='flex flex-col gap-3'>
+                                          <p className='text-sm'>{t('channels.dialogs.fields.apiKey.confirmDisable')}</p>
+                                          <div className='flex justify-end gap-2'>
+                                            <Button size='sm' variant='outline' onClick={() => setConfirmDisableKey(null)}>
+                                              {t('common.buttons.cancel')}
+                                            </Button>
+                                            <Button
+                                              size='sm'
+                                              disabled={disableAPIKey.isPending || isFetchingDisabledKeys}
+                                              onClick={async () => {
+                                                if (!currentRow?.id) return;
+                                                await disableAPIKey.mutateAsync({ channelID: currentRow.id, key });
+                                                setConfirmDisableKey(null);
+                                              }}
+                                            >
+                                              {t('common.buttons.confirm')}
+                                            </Button>
+                                          </div>
+                                        </div>
+                                      </PopoverContent>
+                                    </Popover>
+                                  ))}
+
+                                {/* Delete button */}
+                                {isLastKey ? (
+                                  <Tooltip>
+                                    <TooltipTrigger asChild>
+                                      <span className='inline-flex'>
+                                        <Button
+                                          type='button'
+                                          variant='ghost'
+                                          size='sm'
+                                          className='text-muted-foreground h-7 w-7 p-0'
+                                          disabled
+                                        >
+                                          <Trash2 className='h-4 w-4' />
+                                        </Button>
+                                      </span>
+                                    </TooltipTrigger>
+                                    <TooltipContent>
+                                      <p>{t('channels.dialogs.fields.apiKey.mustKeepOne')}</p>
+                                    </TooltipContent>
+                                  </Tooltip>
+                                ) : (
+                                  <Popover
+                                    open={confirmRemoveKey === key}
+                                    onOpenChange={(isOpen) => setConfirmRemoveKey(isOpen ? key : null)}
+                                  >
+                                    <PopoverTrigger asChild>
+                                      <Button type='button' variant='ghost' size='sm' className='text-destructive h-7 w-7 p-0'>
                                         <Trash2 className='h-4 w-4' />
                                       </Button>
-                                    </span>
-                                  </TooltipTrigger>
-                                  <TooltipContent>
-                                    <p>{t('channels.dialogs.fields.apiKey.mustKeepOne')}</p>
-                                  </TooltipContent>
-                                </Tooltip>
-                              ) : (
-                                <Popover
-                                  open={confirmRemoveKey === key}
-                                  onOpenChange={(isOpen) => setConfirmRemoveKey(isOpen ? key : null)}
-                                >
-                                  <PopoverTrigger asChild>
-                                    <Button type='button' variant='ghost' size='sm' className='text-destructive h-7 w-7 p-0'>
-                                      <Trash2 className='h-4 w-4' />
-                                    </Button>
-                                  </PopoverTrigger>
-                                  <PopoverContent className='w-72'>
-                                    <div className='flex flex-col gap-3'>
-                                      <p className='text-sm'>{t('channels.dialogs.fields.apiKey.confirmRemoveSingle')}</p>
-                                      <div className='flex justify-end gap-2'>
-                                        <Button size='sm' variant='outline' onClick={() => setConfirmRemoveKey(null)}>
-                                          {t('common.buttons.cancel')}
-                                        </Button>
-                                        <Button size='sm' variant='destructive' onClick={() => removeApiKeys([key])}>
-                                          {t('common.buttons.confirm')}
-                                        </Button>
+                                    </PopoverTrigger>
+                                    <PopoverContent className='w-72'>
+                                      <div className='flex flex-col gap-3'>
+                                        <p className='text-sm'>{t('channels.dialogs.fields.apiKey.confirmRemoveSingle')}</p>
+                                        <div className='flex justify-end gap-2'>
+                                          <Button size='sm' variant='outline' onClick={() => setConfirmRemoveKey(null)}>
+                                            {t('common.buttons.cancel')}
+                                          </Button>
+                                          <Button size='sm' variant='destructive' onClick={() => removeApiKeys([key])}>
+                                            {t('common.buttons.confirm')}
+                                          </Button>
+                                        </div>
                                       </div>
-                                    </div>
-                                  </PopoverContent>
-                                </Popover>
-                              )}
+                                    </PopoverContent>
+                                  </Popover>
+                                )}
+                              </div>
                             </div>
                           );
                         });
@@ -3078,6 +3211,7 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
                       setSelectedKeysToRemove(new Set());
                       setConfirmRemoveSelectedOpen(false);
                       setConfirmRemoveKey(null);
+                      setConfirmDisableKey(null);
                     }}
                     disabled={selectedKeysToRemove.size === 0}
                   >

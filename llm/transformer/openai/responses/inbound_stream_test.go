@@ -236,6 +236,103 @@ func TestInboundTransformer_TransformStream_KeepsResponsesReasoningItemsSeparate
 	require.Equal(t, "gAAAA_done_2", lo.FromPtr(lastEvent.Response.Output[1].EncryptedContent))
 }
 
+func TestInboundTransformer_TransformStream_ReplacesItemScopedProvisionalSignature(t *testing.T) {
+	trans := NewInboundTransformer()
+	stream, err := trans.TransformStream(t.Context(), streams.SliceStream([]*llm.Response{
+		{
+			Object: "chat.completion.chunk",
+			TransformerMetadata: map[string]any{
+				responsesReasoningItemTransformerMetadataKey: responsesReasoningItemMetadata{ID: "rs_1"},
+			},
+			Choices: []llm.Choice{{Delta: &llm.Message{
+				ID:                 "rs_1",
+				ReasoningSignature: lo.ToPtr("gAAAA_PROVISIONAL_BLOB"),
+			}}},
+		},
+		{
+			Object: "chat.completion.chunk",
+			TransformerMetadata: map[string]any{
+				responsesReasoningItemTransformerMetadataKey: responsesReasoningItemMetadata{ID: "rs_1", Done: true},
+			},
+			Choices: []llm.Choice{{Delta: &llm.Message{
+				ID:                 "rs_1",
+				ReasoningSignature: lo.ToPtr("gAAAA_FINAL_BLOB"),
+			}}},
+		},
+		{Object: "chat.completion.chunk", Choices: []llm.Choice{{Delta: &llm.Message{}, FinishReason: lo.ToPtr("stop")}}},
+		{Object: "chat.completion.chunk", Usage: &llm.Usage{}},
+	}))
+	require.NoError(t, err)
+
+	var doneItems []Item
+	for stream.Next() {
+		var event StreamEvent
+		require.NoError(t, json.Unmarshal(stream.Current().Data, &event))
+		if event.Type == StreamEventTypeOutputItemDone && event.Item != nil && event.Item.Type == "reasoning" {
+			doneItems = append(doneItems, *event.Item)
+		}
+	}
+	require.NoError(t, stream.Err())
+	require.Len(t, doneItems, 1)
+	require.Equal(t, "rs_1", doneItems[0].ID)
+	require.Equal(t, "gAAAA_FINAL_BLOB", lo.FromPtr(doneItems[0].EncryptedContent))
+	require.NotEqual(t, "gAAAA_PROVISIONAL_BLOBgAAAA_FINAL_BLOB", lo.FromPtr(doneItems[0].EncryptedContent))
+}
+
+func TestInboundTransformer_TransformStream_UsesItemMetadataForSummaryDeltas(t *testing.T) {
+	trans := NewInboundTransformer()
+	stream, err := trans.TransformStream(t.Context(), streams.SliceStream([]*llm.Response{
+		{
+			Object: "chat.completion.chunk",
+			TransformerMetadata: map[string]any{
+				responsesReasoningItemTransformerMetadataKey: map[string]any{"id": "rs_first"},
+			},
+			Choices: []llm.Choice{{Delta: &llm.Message{ReasoningContent: lo.ToPtr("first")}}},
+		},
+		{
+			Object: "chat.completion.chunk",
+			TransformerMetadata: map[string]any{
+				responsesReasoningItemTransformerMetadataKey: map[string]any{"id": "rs_second"},
+			},
+			Choices: []llm.Choice{{Delta: &llm.Message{ReasoningContent: lo.ToPtr("second")}}},
+		},
+		{
+			Object: "chat.completion.chunk",
+			TransformerMetadata: map[string]any{
+				responsesReasoningItemTransformerMetadataKey: map[string]any{"id": "rs_first", "done": true},
+			},
+			Choices: []llm.Choice{{Delta: &llm.Message{ID: "rs_first", ReasoningSignature: lo.ToPtr("gAAAA_FIRST_BLOB")}}},
+		},
+		{
+			Object: "chat.completion.chunk",
+			TransformerMetadata: map[string]any{
+				responsesReasoningItemTransformerMetadataKey: map[string]any{"id": "rs_second", "done": true},
+			},
+			Choices: []llm.Choice{{Delta: &llm.Message{ID: "rs_second", ReasoningSignature: lo.ToPtr("gAAAA_SECOND_BLOB")}}},
+		},
+		{Object: "chat.completion.chunk", Choices: []llm.Choice{{Delta: &llm.Message{}, FinishReason: lo.ToPtr("stop")}}},
+		{Object: "chat.completion.chunk", Usage: &llm.Usage{}},
+	}))
+	require.NoError(t, err)
+
+	var doneItems []Item
+	for stream.Next() {
+		var event StreamEvent
+		require.NoError(t, json.Unmarshal(stream.Current().Data, &event))
+		if event.Type == StreamEventTypeOutputItemDone && event.Item != nil && event.Item.Type == "reasoning" {
+			doneItems = append(doneItems, *event.Item)
+		}
+	}
+	require.NoError(t, stream.Err())
+	require.Len(t, doneItems, 2)
+	require.Equal(t, "rs_first", doneItems[0].ID)
+	require.Equal(t, "first", doneItems[0].Summary[0].Text)
+	require.Equal(t, "gAAAA_FIRST_BLOB", lo.FromPtr(doneItems[0].EncryptedContent))
+	require.Equal(t, "rs_second", doneItems[1].ID)
+	require.Equal(t, "second", doneItems[1].Summary[0].Text)
+	require.Equal(t, "gAAAA_SECOND_BLOB", lo.FromPtr(doneItems[1].EncryptedContent))
+}
+
 func TestInboundTransformer_TransformStream_PreservesWebSearchCallsFromChunkMetadata(t *testing.T) {
 	trans := NewInboundTransformer()
 
@@ -424,4 +521,126 @@ func (s *errorResponseStream) Err() error {
 
 func (s *errorResponseStream) Close() error {
 	return nil
+}
+
+// Chat Completions finish_reason must be propagated onto the Responses
+// response.completed status: truncation and failure are otherwise silently
+// reported as a successful completion downstream.
+func TestInboundTransformer_TransformStream_MapsFinishReasonToCompletedStatus(t *testing.T) {
+	tests := []struct {
+		name                 string
+		finishReason         string
+		expectedStatus       string
+		expectedIncomplete   *ResponseIncompleteDetails
+	}{
+		{name: "length maps to incomplete", finishReason: "length", expectedStatus: "incomplete", expectedIncomplete: &ResponseIncompleteDetails{Reason: "max_output_tokens"}},
+		{name: "content_filter maps to incomplete", finishReason: "content_filter", expectedStatus: "incomplete", expectedIncomplete: &ResponseIncompleteDetails{Reason: "content_filter"}},
+		{name: "error maps to failed", finishReason: "error", expectedStatus: "failed"},
+		{name: "cancelled maps to cancelled", finishReason: "cancelled", expectedStatus: "cancelled"},
+		{name: "canceled (US spelling) maps to cancelled", finishReason: "canceled", expectedStatus: "cancelled"},
+		{name: "unknown finish reason stays completed", finishReason: "bogus", expectedStatus: "completed"},
+		{name: "stop stays completed", finishReason: "stop", expectedStatus: "completed"},
+		{name: "tool_calls stays completed", finishReason: "tool_calls", expectedStatus: "completed"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			trans := NewInboundTransformer()
+
+			stream, err := trans.TransformStream(t.Context(), streams.SliceStream([]*llm.Response{
+				{
+					Object:  "chat.completion.chunk",
+					ID:      "resp_finish_reason_map",
+					Created: 1700000000,
+					Model:   "gpt-5",
+					Choices: []llm.Choice{{
+						Index:        0,
+						Delta:        &llm.Message{Role: "assistant"},
+						FinishReason: lo.ToPtr(tt.finishReason),
+					}},
+				},
+				{
+					Object:  "chat.completion.chunk",
+					ID:      "resp_finish_reason_map",
+					Created: 1700000000,
+					Model:   "gpt-5",
+					Usage:   &llm.Usage{PromptTokens: 1, CompletionTokens: 1, TotalTokens: 2},
+				},
+			}))
+			require.NoError(t, err)
+
+			var completed *Response
+			for stream.Next() {
+				var ev StreamEvent
+				require.NoError(t, json.Unmarshal(stream.Current().Data, &ev))
+				if ev.Type == StreamEventTypeResponseCompleted && ev.Response != nil {
+					completed = ev.Response
+				}
+			}
+			require.NoError(t, stream.Err())
+
+			require.NotNil(t, completed)
+			require.NotNil(t, completed.Status)
+			require.Equal(t, tt.expectedStatus, *completed.Status)
+			if tt.expectedIncomplete != nil {
+				require.NotNil(t, completed.IncompleteDetails)
+				require.Equal(t, tt.expectedIncomplete.Reason, completed.IncompleteDetails.Reason)
+			} else {
+				require.Nil(t, completed.IncompleteDetails)
+			}
+		})
+	}
+}
+
+// When the usage chunk arrives before the finish_reason chunk, the terminal
+// status mapped from finish_reason must still be preserved by the stream-end
+// fallback path (it must not be overwritten with "completed").
+func TestInboundTransformer_TransformStream_UsageBeforeFinishReasonKeepsMappedStatus(t *testing.T) {
+	trans := NewInboundTransformer()
+
+	stream, err := trans.TransformStream(t.Context(), streams.SliceStream([]*llm.Response{
+		{
+			Object:  "chat.completion.chunk",
+			ID:      "resp_usage_first",
+			Created: 1700000000,
+			Model:   "gpt-5",
+			Choices: []llm.Choice{{Index: 0, Delta: &llm.Message{Role: "assistant"}}},
+		},
+		// Usage arrives before the terminal finish_reason.
+		{
+			Object:  "chat.completion.chunk",
+			ID:      "resp_usage_first",
+			Created: 1700000000,
+			Model:   "gpt-5",
+			Usage:   &llm.Usage{PromptTokens: 1, CompletionTokens: 1, TotalTokens: 2},
+		},
+		{
+			Object:  "chat.completion.chunk",
+			ID:      "resp_usage_first",
+			Created: 1700000000,
+			Model:   "gpt-5",
+			Choices: []llm.Choice{{
+				Index:        0,
+				Delta:        &llm.Message{},
+				FinishReason: lo.ToPtr("length"),
+			}},
+		},
+	}))
+	require.NoError(t, err)
+
+	var completed *Response
+	for stream.Next() {
+		var ev StreamEvent
+		require.NoError(t, json.Unmarshal(stream.Current().Data, &ev))
+		if ev.Type == StreamEventTypeResponseCompleted && ev.Response != nil {
+			completed = ev.Response
+		}
+	}
+	require.NoError(t, stream.Err())
+
+	require.NotNil(t, completed)
+	require.NotNil(t, completed.Status)
+	require.Equal(t, "incomplete", *completed.Status)
+	require.NotNil(t, completed.IncompleteDetails)
+	require.Equal(t, "max_output_tokens", completed.IncompleteDetails.Reason)
 }
